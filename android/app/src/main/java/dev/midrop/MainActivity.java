@@ -15,14 +15,19 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.HttpsURLConnection;
-import org.json.JSONObject;
+import org.json.*;
 
 public class MainActivity extends Activity {
     static volatile boolean visible=false;
     private final Handler main=new Handler(Looper.getMainLooper());
     private final ExecutorService worker=Executors.newSingleThreadExecutor();
     private Skin skin;
-    private LinearLayout devices,fileArea,progressArea;
+    private LinearLayout devices,fileArea,progressArea,boardPage,filePage;
+    private EditText boardEditor;
+    private TextView boardStatus;
+    private Button boardTab,fileTab,boardConflict,boardOpen;
+    private boolean applyingBoard;
+    private final Runnable boardSync=() -> { if (visible && SessionService.instance==null) SessionService.start(this); SessionService.visibilityChanged(); };
     private TextView connectionLabel,progressTitle,progressDetail;
     private ProgressBar progress;
     private Button cancel;
@@ -32,7 +37,7 @@ public class MainActivity extends Activity {
     private boolean connecting;
     private final Runnable poll=new Runnable() { public void run() {
         if (!visible) return;
-        refreshDevices(false); refreshProgress(); main.postDelayed(this,500);
+        refreshDevices(false); refreshProgress(); refreshBoard(); main.postDelayed(this,500);
     }};
 
     @Override public void onCreate(Bundle state) {
@@ -43,12 +48,12 @@ public class MainActivity extends Activity {
         getWindow().setStatusBarColor(skin.bg); getWindow().setNavigationBarColor(skin.bg);
         getWindow().getDecorView().setSystemUiVisibility(skin.dark?0:View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR|View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         ScrollView scroll=new ScrollView(this); scroll.setFillViewport(true); scroll.setBackgroundColor(skin.bg);
-        LinearLayout root=skin.column(); root.setPadding(skin.dp(22),skin.dp(20),skin.dp(22),skin.dp(24)); scroll.addView(root);
+        LinearLayout outer=skin.column(); outer.setPadding(skin.dp(22),skin.dp(20),skin.dp(22),skin.dp(24)); scroll.addView(outer);
         scroll.setOnApplyWindowInsetsListener((v,insets) -> {
             int top,bottom;
             if (Build.VERSION.SDK_INT>=30) { android.graphics.Insets bars=insets.getInsets(WindowInsets.Type.systemBars()); top=bars.top; bottom=bars.bottom; }
             else { top=insets.getSystemWindowInsetTop(); bottom=insets.getSystemWindowInsetBottom(); }
-            root.setPadding(skin.dp(22),top+skin.dp(20),skin.dp(22),bottom+skin.dp(24)); return insets;
+            outer.setPadding(skin.dp(22),top+skin.dp(20),skin.dp(22),bottom+skin.dp(24)); return insets;
         });
         setContentView(scroll);
         LinearLayout header=new LinearLayout(this); header.setGravity(Gravity.CENTER_VERTICAL);
@@ -61,7 +66,14 @@ public class MainActivity extends Activity {
             android.content.res.ColorStateList.valueOf(skin.dark?0x24FFFFFF:0x18000000),null,skin.shape(android.graphics.Color.WHITE,24)));
         settings.setPadding(skin.dp(12),skin.dp(12),skin.dp(12),skin.dp(12));
         settings.setScaleType(ImageView.ScaleType.CENTER_INSIDE); settings.setContentDescription("设置");
-        settings.setOnClickListener(v -> settings()); header.addView(settings,new LinearLayout.LayoutParams(skin.dp(48),skin.dp(48))); root.addView(header);
+        settings.setOnClickListener(v -> settings()); header.addView(settings,new LinearLayout.LayoutParams(skin.dp(48),skin.dp(48))); outer.addView(header);
+        skin.gap(outer,24);
+        LinearLayout tabs=new LinearLayout(this); tabs.setPadding(skin.dp(4),skin.dp(4),skin.dp(4),skin.dp(4)); tabs.setBackground(skin.shape(skin.line,16));
+        boardTab=pageTab("公告板"); fileTab=pageTab("文件");
+        tabs.addView(boardTab,new LinearLayout.LayoutParams(0,skin.dp(40),1)); tabs.addView(fileTab,new LinearLayout.LayoutParams(0,skin.dp(40),1)); outer.addView(tabs);
+        boardTab.setOnClickListener(v -> selectPage(true)); fileTab.setOnClickListener(v -> selectPage(false));
+        boardPage=skin.column(); outer.addView(boardPage); buildBoard();
+        LinearLayout root=skin.column(); filePage=root; outer.addView(root);
         skin.gap(root,28);
         TextView subtitle=skin.text("在你的设备之间，轻松传递。",15,skin.muted); root.addView(subtitle);
         skin.gap(root,24);
@@ -85,6 +97,7 @@ public class MainActivity extends Activity {
         }); progressArea.addView(cancel);
         discovery=list -> { nearby=list; refreshDevices(true); };
         Protocol.clientId(this);
+        selectPage(!hasFiles()); refreshBoard(); main.post(this::handleSharedText);
     }
     @Override protected void onStart() { super.onStart(); visible=true; Discovery.get(this).add(discovery); SessionService.start(this); SessionService.visibilityChanged(); main.post(poll); }
     @Override protected void onStop() {
@@ -92,9 +105,9 @@ public class MainActivity extends Activity {
         if (!Protocol.prefs(this).getBoolean("background_receive",true) && !SessionService.RECEIVING.get()) stopService(new Intent(this,SessionService.class));
         super.onStop();
     }
-    @Override protected void onDestroy() { worker.shutdownNow(); super.onDestroy(); }
-    @Override protected void onNewIntent(Intent intent) { super.onNewIntent(intent); setIntent(intent); renderFiles(); }
-    private boolean hasFiles() { return !TransferService.uris(getIntent()).isEmpty() || getIntent().getCharSequenceExtra(Intent.EXTRA_TEXT)!=null; }
+    @Override protected void onDestroy() { worker.shutdownNow(); main.removeCallbacks(boardSync); super.onDestroy(); }
+    @Override protected void onNewIntent(Intent intent) { super.onNewIntent(intent); setIntent(intent); handleSharedText(); renderFiles(); refreshDevices(true); selectPage(!hasFiles()); }
+    private boolean hasFiles() { return !TransferService.uris(getIntent()).isEmpty(); }
     private void renderFiles() {
         fileArea.removeAllViews(); LinearLayout card=skin.card(); fileArea.addView(card);
         ArrayList<Uri> uris=TransferService.uris(getIntent());
@@ -114,7 +127,74 @@ public class MainActivity extends Activity {
             if (uris.isEmpty()) { TextView t=skin.text(getIntent().getCharSequenceExtra(Intent.EXTRA_TEXT).toString(),14,skin.muted); t.setMaxLines(2); t.setEllipsize(TextUtils.TruncateAt.END); card.addView(t); }
             skin.gap(card,14); card.addView(skin.text("点击下方设备即可发送",13,skin.muted));
             Button change=skin.button("更换文件",false); change.setOnClickListener(v -> choose()); card.addView(change);
+            Button clear=skin.button("清除选择",false); clear.setOnClickListener(v -> { setIntent(new Intent()); renderFiles(); refreshDevices(true); }); card.addView(clear);
         }
+    }
+    private Button pageTab(String title) {
+        Button button=new Button(this); button.setText(title); button.setAllCaps(false); button.setTextSize(14); button.setStateListAnimator(null);
+        button.setPadding(0,0,0,0); return button;
+    }
+    private void selectPage(boolean board) {
+        boardPage.setVisibility(board?View.VISIBLE:View.GONE); filePage.setVisibility(board?View.GONE:View.VISIBLE);
+        boardTab.setBackground(skin.shape(board?skin.card:android.graphics.Color.TRANSPARENT,12));
+        fileTab.setBackground(skin.shape(board?android.graphics.Color.TRANSPARENT:skin.card,12));
+        boardTab.setTextColor(board?skin.text:skin.muted); fileTab.setTextColor(board?skin.muted:skin.text);
+    }
+    private Button boardTool(String title) {
+        Button button=new Button(this); button.setText(title); button.setAllCaps(false); button.setTextSize(12); button.setTextColor(skin.muted);
+        button.setMinWidth(0); button.setMinimumWidth(0); button.setPadding(skin.dp(8),0,skin.dp(8),0);
+        button.setBackgroundColor(android.graphics.Color.TRANSPARENT); return button;
+    }
+    private void buildBoard() {
+        skin.gap(boardPage,28);
+        TextView title=skin.text("共享公告板",25,skin.text); title.setTypeface(null,Typeface.BOLD); boardPage.addView(title); skin.gap(boardPage,9);
+        boardPage.addView(skin.text("写在这里，连接的设备都会看到。",13,skin.muted)); skin.gap(boardPage,22);
+        boardEditor=new EditText(this); boardEditor.setContentDescription("共享公告板内容"); boardEditor.setHint("记下一段文字，或粘贴一个链接…");
+        boardEditor.setTextColor(skin.text); boardEditor.setHintTextColor(skin.muted); boardEditor.setTextSize(16);
+        boardEditor.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE|android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        boardEditor.setGravity(Gravity.TOP); boardEditor.setPadding(skin.dp(20),skin.dp(22),skin.dp(20),skin.dp(22));
+        boardEditor.setLineSpacing(skin.dp(5),1); boardEditor.setBackground(skin.shape(skin.card,22));
+        int screenHeight=Math.round(getResources().getDisplayMetrics().heightPixels/getResources().getDisplayMetrics().density);
+        boardPage.addView(boardEditor,new LinearLayout.LayoutParams(-1,skin.dp(Math.max(300,screenHeight-330))));
+        boardEditor.addTextChangedListener(new android.text.TextWatcher() {
+            public void beforeTextChanged(CharSequence s,int start,int count,int after) {}
+            public void onTextChanged(CharSequence s,int start,int before,int count) {
+                if (applyingBoard) return;
+                BoardStore.edit(MainActivity.this,s.toString());
+                main.removeCallbacks(boardSync); main.postDelayed(boardSync,650);
+                refreshBoard();
+            }
+            public void afterTextChanged(android.text.Editable value) {}
+        });
+        skin.gap(boardPage,10);
+        LinearLayout tools=new LinearLayout(this); tools.setGravity(Gravity.CENTER_VERTICAL);
+        boardStatus=skin.text("等待电脑连接",11,skin.muted); boardStatus.setMaxLines(2); tools.addView(boardStatus,new LinearLayout.LayoutParams(0,-2,1));
+        Button paste=boardTool("粘贴"),copy=boardTool("复制"),clear=boardTool("清空");
+        tools.addView(paste,new LinearLayout.LayoutParams(skin.dp(48),skin.dp(44))); tools.addView(copy,new LinearLayout.LayoutParams(skin.dp(48),skin.dp(44))); tools.addView(clear,new LinearLayout.LayoutParams(skin.dp(48),skin.dp(44))); boardPage.addView(tools);
+        paste.setOnClickListener(v -> { ClipboardManager clipboard=(ClipboardManager)getSystemService(CLIPBOARD_SERVICE); if (clipboard.hasPrimaryClip()) boardEditor.setText(clipboard.getPrimaryClip().getItemAt(0).coerceToText(this)); });
+        copy.setOnClickListener(v -> { ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("MiDrop",boardEditor.getText())); toast("已复制"); });
+        clear.setOnClickListener(v -> boardEditor.setText(""));
+        boardOpen=boardTool("打开链接 ↗"); boardOpen.setOnClickListener(v -> { Uri link=TextSharing.webLink(BoardStore.draft(this)); if (link!=null) try { startActivity(new Intent(Intent.ACTION_VIEW,link)); } catch (Exception e) { toast("没有可打开链接的应用"); } }); boardPage.addView(boardOpen);
+        boardConflict=boardTool("使用另一端内容"); boardConflict.setOnClickListener(v -> { BoardStore.useRemote(this); refreshBoard(); }); boardPage.addView(boardConflict);
+        boardEditor.clearFocus();
+    }
+    private void refreshBoard() {
+        if (boardEditor==null) return;
+        String draft=BoardStore.draft(this);
+        if (!boardEditor.getText().toString().equals(draft)) {
+            int cursor=Math.max(0,boardEditor.getSelectionStart()); applyingBoard=true;
+            boardEditor.setText(draft); boardEditor.setSelection(Math.min(cursor,draft.length())); applyingBoard=false;
+        }
+        boardStatus.setText(BoardStore.status(this));
+        boardConflict.setVisibility(Protocol.prefs(this).getBoolean("board_conflict",false)?View.VISIBLE:View.GONE);
+        boardOpen.setVisibility(TextSharing.webLink(draft)!=null?View.VISIBLE:View.GONE);
+    }
+    private void handleSharedText() {
+        CharSequence value=getIntent().getCharSequenceExtra(Intent.EXTRA_TEXT);
+        if (value==null || !TransferService.uris(getIntent()).isEmpty()) return;
+        try { BoardStore.validate(value.toString()); BoardStore.edit(this,value.toString()); refreshBoard(); selectPage(true); main.removeCallbacks(boardSync); main.postDelayed(boardSync,650); }
+        catch (Exception error) { toast(error.getMessage()); }
+        getIntent().removeExtra(Intent.EXTRA_TEXT);
     }
     private void choose() {
         if (busy()) { toast("请等待当前传输完成"); return; }
@@ -126,7 +206,7 @@ public class MainActivity extends Activity {
         if (r==21 && result==RESULT_OK && data!=null) {
             Intent i=new Intent(Intent.ACTION_SEND_MULTIPLE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             if (data.getClipData()!=null) i.setClipData(data.getClipData()); else i.putExtra(Intent.EXTRA_STREAM,data.getData());
-            setIntent(i); renderFiles(); refreshDevices(true);
+            setIntent(i); renderFiles(); refreshDevices(true); selectPage(false);
         }
     }
     private boolean busy() { return connecting || TransferService.ACTIVE.get() || SessionService.RECEIVING.get(); }
@@ -273,7 +353,7 @@ public class MainActivity extends Activity {
                 .setNegativeButton("取消",null).setPositiveButton("重新连接",(d,w) -> {
                     stopService(new Intent(this,SessionService.class)); Protocol.prefs(this).edit().remove("token").remove("pin").remove("server_id").putBoolean("connected",false).apply(); refreshDevices(true);
                 }).show();
-        }); content.addView(forget); skin.gap(content,16); content.addView(skin.text("MiDrop 0.2.2 · 局域网加密传输",12,skin.muted));
+        }); content.addView(forget); skin.gap(content,16); content.addView(skin.text("MiDrop 0.4.0 · 局域网加密传输",12,skin.muted));
         ScrollView scroll=new ScrollView(this); scroll.addView(content);
         new AlertDialog.Builder(this).setTitle("设置").setView(scroll).setPositiveButton("完成",null).show();
     }

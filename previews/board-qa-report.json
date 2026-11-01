@@ -1,0 +1,17 @@
+{
+  "android_api": 36,
+  "passed": [
+    "board replaces send/history/device-selection UI",
+    "PC edits visible on phone; phone edits automatically visible on PC",
+    "same board visible to all paired clients without selecting a recipient",
+    "Unicode, whitespace and newlines preserved; explicit clipboard copy",
+    "Android system text sharing edits the board without a send step",
+    "background sync and notification permission denied",
+    "offline draft retained; stale write cannot overwrite remote updates",
+    "use remote content and synchronized clear",
+    "no message history, downloaded text files or MediaStore rows created"
+  ],
+  "not_verified": [
+    "physical REDMI / HyperOS"
+  ]
+}

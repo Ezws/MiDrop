@@ -311,6 +311,144 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(complete.read_bytes(),b"user content")
         self.assertTrue(restored.authorized(self.token))
 
+    def text_receiver(self):
+        key = module.token_hash(self.token)
+        self.receiver.events(key, True, wait=0, text_support=True, receiving_text=True)
+        return key
+
+    def test_text_phone_to_mac_preserves_content_and_deduplicates(self):
+        text = '  中文、emoji 🐈\nhttps://example.com/?a=1&b=%E4%B8%AD\n  '
+        payload = {'id': 'phone-message-1', 'text': text}
+        status, result = self.post_json('/texts', payload)
+        self.assertEqual(status, 201)
+        self.assertEqual(self.post_json('/texts', payload), (200, result))
+        messages = [m for m in self.receiver.texts if m['id'] == result['id']]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]['text'], text)
+        self.assertEqual(messages[0]['state'], 'completed')
+        self.assertEqual(self.post_json('/texts', dict(payload, text='changed'))[0], 400)
+        self.assertEqual(self.receiver.texts[-1]['text'], text)
+        self.assertNotIn('owner', self.receiver.public_text(messages[0]))
+        self.assertEqual((self.receiver.root/'texts.json').stat().st_mode & 0o777, 0o600)
+
+    def test_text_mac_to_phone_delivery_ack_and_device_isolation(self):
+        key = self.text_receiver()
+        text = '多行\nhttps://example.com/路径?q=猫#中文'
+        message = self.receiver.control({'action': 'send_text', 'device_id': key[:24], 'text': text})
+        mid = message['id']
+        stranger = self.receiver.add_device('Other phone')
+        status, events = self.post_json('/events', {'receiving': True, 'text_support': True, 'receiving_text': True, 'wait': False})
+        self.assertEqual(status, 200)
+        self.assertEqual(next(m['text'] for m in events['texts'] if m['id'] == mid), text)
+        self.assertEqual(self.receiver.events(module.token_hash(stranger), True, wait=0, text_support=True, receiving_text=True)[1]['texts'], [])
+        self.assertEqual(self.request('/texts/'+mid+'/ack', b'{}', {'Authorization': 'Bearer '+stranger})[0], 404)
+        self.assertEqual(self.post_json('/texts/'+mid+'/ack', {})[0], 200)
+        self.assertEqual(self.post_json('/texts/'+mid+'/ack', {})[0], 200)
+        self.assertEqual(self.receiver.events(key, True, wait=0, text_support=True, receiving_text=True)[1]['texts'], [])
+        self.assertEqual(next(m['state'] for m in self.receiver.texts if m['id'] == mid), 'completed')
+
+    def test_text_rejects_unpaired_invalid_and_oversize_payloads(self):
+        self.assertEqual(self.request('/texts', b'{"id":"x","text":"private"}')[0], 401)
+        for text in ('', ' \n\t ', None, 123, '猫'*(module.MAX_TEXT//3+1)):
+            self.assertEqual(self.post_json('/texts', {'id': 'invalid', 'text': text})[0], 400)
+        boundary = 'a'*module.MAX_TEXT
+        self.assertEqual(self.post_json('/texts', {'id': 'boundary', 'text': boundary})[0], 201)
+
+    def test_text_capability_pause_and_no_storage_requirement(self):
+        key = module.token_hash(self.token)
+        self.receiver.events(key, True, wait=0)
+        with self.assertRaisesRegex(ValueError, '更新'):
+            self.receiver.queue_text(key[:24], 'hello')
+        self.receiver.events(key, False, wait=0, text_support=True, receiving_text=False)
+        with self.assertRaisesRegex(ValueError, '暂停'):
+            self.receiver.queue_text(key[:24], 'hello')
+        self.receiver.events(key, False, wait=0, text_support=True, receiving_text=True)
+        mid = self.receiver.queue_text(key[:24], 'works without storage')['id']
+        self.assertIn(mid, [m['id'] for m in self.receiver.events(key, False, wait=0, text_support=True, receiving_text=True)[1]['texts']])
+
+    def test_text_expiry_revocation_and_restart(self):
+        key = self.text_receiver()
+        mid = self.receiver.queue_text(key[:24], 'expire')['id']
+        next(m for m in self.receiver.texts if m['id'] == mid)['expires'] = 0
+        self.receiver.sweep()
+        self.assertEqual(self.post_json('/texts/'+mid+'/ack', {})[0], 409)
+        cancelled = self.receiver.queue_text(key[:24], 'cancel on revoke')['id']
+        self.receiver.revoke(key[:24])
+        self.assertEqual(next(m['state'] for m in self.receiver.texts if m['id'] == cancelled), 'cancelled')
+        self.assertEqual(self.post_json('/texts', {'id': 'revoked', 'text': 'not allowed'})[0], 401)
+        other = self.receiver.add_device('Restart phone')
+        other_key = module.token_hash(other)
+        self.receiver.events(other_key, True, wait=0, text_support=True, receiving_text=True)
+        pending = self.receiver.queue_text(other_key[:24], 'interrupted')['id']
+        restored = module.Receiver(self.receiver.root, self.receiver.destination)
+        self.assertEqual(next(m['state'] for m in restored.texts if m['id'] == pending), 'failed')
+
+    def test_text_history_does_not_evict_pending_delivery(self):
+        key = self.text_receiver()
+        mid = self.receiver.queue_text(key[:24], 'keep pending')['id']
+        for i in range(24):
+            self.assertEqual(self.post_json('/texts', {'id': 'history-'+str(i), 'text': str(i)})[0], 201)
+        self.assertEqual(len([m for m in self.receiver.texts if m['state'] != 'pending']), 20)
+        self.assertEqual(next(m['state'] for m in self.receiver.texts if m['id'] == mid), 'pending')
+
+    def test_board_broadcasts_to_all_trusted_connected_devices(self):
+        key=module.token_hash(self.token)
+        other=self.receiver.add_device('Second phone')
+        before=self.receiver.board['revision']
+        text='  共享公告板 🐈\nhttps://example.com/?a=1&b=猫\n '
+        status,result=self.post_json('/board',{'text':text,'base_revision':before})
+        self.assertEqual(status,200)
+        for device in (key,module.token_hash(other)):
+            status,events=self.receiver.events(device,False,wait=0,board_support=True,board_revision=before)
+            self.assertEqual(events['board']['text'],text)
+            self.assertEqual(events['board']['revision'],before+1)
+        # The board is independent of file receiving and needs no recipient.
+        self.assertEqual(self.receiver.control({'action':'update_board','text':'from Mac','base_revision':before+1})['board']['text'],'from Mac')
+        self.assertTrue(self.receiver.public_devices()[0]['supports_board'])
+
+    def test_board_stale_writes_conflict_and_retries_are_idempotent(self):
+        revision=self.receiver.board['revision']
+        first=self.post_json('/board',{'text':'first writer','base_revision':revision})[1]['board']
+        status,conflict=self.post_json('/board',{'text':'stale writer','base_revision':revision})
+        self.assertEqual(status,409)
+        self.assertEqual(conflict['board'],first)
+        self.assertEqual(self.receiver.board,first)
+        status,retry=self.post_json('/board',{'text':'first writer','base_revision':revision})
+        self.assertEqual(status,200)
+        self.assertEqual(retry['board']['revision'],first['revision'])
+
+    def test_board_clear_persistence_and_authorization(self):
+        revision=self.receiver.board['revision']
+        self.assertEqual(self.request('/board',b'',method='GET')[0],401)
+        self.assertEqual(self.request('/board',b'{"text":"bad","base_revision":0}')[0],401)
+        self.post_json('/board',{'text':'persistent','base_revision':revision})
+        restored=module.Receiver(self.receiver.root,self.receiver.destination)
+        self.assertEqual(restored.board['text'],'persistent')
+        self.assertEqual((self.receiver.root/'board.json').stat().st_mode & 0o777,0o600)
+        self.assertEqual(self.post_json('/board',{'text':'','base_revision':revision+1})[0],200)
+        self.assertEqual(self.receiver.board['text'],'')
+        self.receiver.revoke(module.token_hash(self.token)[:24])
+        self.assertEqual(self.post_json('/board',{'text':'revoked','base_revision':revision+2})[0],401)
+
+    def test_board_limits_and_long_poll_wakeup(self):
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        revision=self.receiver.board['revision']
+        for payload in ({'text':None,'base_revision':revision},{'text':'a','base_revision':True},
+                        {'text':'猫'*(module.MAX_TEXT//3+1),'base_revision':revision}):
+            self.assertEqual(self.post_json('/board',payload)[0],400)
+        key=module.token_hash(self.token)
+        self.receiver.events(key,False,wait=0,board_support=True,board_revision=revision)
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            pending=worker.submit(self.receiver.events,key,False,3,None,False,False,True,revision)
+            time.sleep(.1)
+            self.receiver.control({'action':'update_board','text':'wake-'+str(revision),'base_revision':revision})
+            self.assertEqual(pending.result(timeout=1)[1]['board']['revision'],revision+1)
+        # An unchanged board must not repeatedly wake the idle client.
+        started=time.monotonic()
+        self.receiver.events(key,False,wait=.15,board_support=True,board_revision=revision+1)
+        self.assertGreaterEqual(time.monotonic()-started,.12)
+
 
 if __name__ == "__main__":
     unittest.main()

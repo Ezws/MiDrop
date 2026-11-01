@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 MAX_FILE = 20 * 1024 ** 3
+MAX_TEXT = 64 * 1024
 TERMINAL = {'completed', 'rejected', 'cancelled', 'expired', 'failed'}
 
 
@@ -81,6 +82,12 @@ class Receiver:
         self.devices = read_json(self.tokens_path, {})
         self.meta = read_json(self.root / 'device_meta.json', {})
         self.recent = read_json(self.root / 'history.json', [])[-20:]
+        self.board = read_json(self.root / 'board.json', {'revision': 0, 'text': '', 'updated': 0})
+        self.texts = read_json(self.root / 'texts.json', [])
+        for message in self.texts:
+            if message['state'] == 'pending':
+                message['state'] = 'failed'
+        self.save_texts()
         self.sessions, self.pair_requests, self.jobs = {}, {}, {}
         self.attempts, self.trust_attempts = [], []
         self.port = 0
@@ -119,7 +126,11 @@ class Receiver:
         return [dict(id=key[:24], name=self.meta.get(key, {}).get('name', name),
                      online=now - self.sessions.get(key, {}).get('seen', 0) < 60,
                      receiving=(now - self.sessions.get(key, {}).get('seen', 0) < 60
-                                and self.sessions.get(key, {}).get('receiving', False)))
+                                and self.sessions.get(key, {}).get('receiving', False)),
+                     supports_text=self.sessions.get(key, {}).get('text_support', False),
+                     supports_board=self.sessions.get(key, {}).get('board_support', False),
+                     receiving_text=(now - self.sessions.get(key, {}).get('seen', 0) < 60
+                                     and self.sessions.get(key, {}).get('receiving_text', False)))
                 for key, name in self.devices.items()]
 
     def public_job(self, job):
@@ -138,7 +149,8 @@ class Receiver:
                 'pending_pairs': [{k: p[k] for k in ('id', 'name', 'peer', 'expires')}
                                   for p in self.pair_requests.values() if p['state'] == 'pending'],
                 'transfers': [self.public_job(j) for j in list(self.jobs.values())[-30:]],
-                'recent': self.recent[-20:][::-1]}
+                'recent': self.recent[-20:][::-1],
+                'texts': [self.public_text(m) for m in self.texts[::-1]], 'board': self.board}
             # Keep heartbeats and housekeeping from waking the menu-bar UI.
             # Store serialized bytes rather than mutable job/recent dictionaries.
             encoded = json.dumps(snapshot, ensure_ascii=False)
@@ -162,6 +174,102 @@ class Receiver:
         self.meta[key] = dict(name=name[:80], client_id=client_id, created=time.time())
         self.save_devices()
         return token
+
+    @staticmethod
+    def public_text(message):
+        return {k: v for k, v in message.items() if k not in ('owner', 'client_id')}
+
+    def update_board(self, text, base_revision, key=None):
+        if not isinstance(text, str) or len(text.encode('utf-8')) > MAX_TEXT:
+            raise ValueError('公告板内容不能超过 64 KiB')
+        if type(base_revision) is not int or base_revision < 0:
+            raise ValueError('无效的公告板版本')
+        with self.lock:
+            if key is not None and key not in self.devices:
+                return 401, {'error': '设备信任已撤销，请重新连接'}
+            if text == self.board['text']:
+                return 200, {'ok': True, 'board': self.board}
+            if base_revision != self.board['revision']:
+                return 409, {'error': '另一端已更新公告板，本地草稿已保留', 'conflict': True, 'board': self.board}
+            board = dict(text=text, revision=self.board['revision']+1, updated=time.time())
+            atomic_json(self.root / 'board.json', board)
+            self.board = board
+            self.publish()
+            return 200, {'ok': True, 'board': board}
+
+    def save_texts(self):
+        # Keep pending deliveries even when new incoming messages fill history.
+        pending = [m for m in self.texts if m['state'] == 'pending']
+        history = [m for m in self.texts if m['state'] != 'pending'][-20:]
+        self.texts = sorted(pending + history, key=lambda m: m['time'])
+        atomic_json(self.root / 'texts.json', self.texts)
+
+    @staticmethod
+    def validate_text(text):
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError('请输入文字或链接')
+        if len(text.encode('utf-8')) > MAX_TEXT:
+            raise ValueError('文字不能超过 64 KiB')
+        return text
+
+    def receive_text(self, key, data):
+        text = self.validate_text(data.get('text'))
+        client_id = data.get('id')
+        if not isinstance(client_id, str) or not re.fullmatch(r'[A-Za-z0-9-]{1,80}', client_id):
+            raise ValueError('无效的消息 ID')
+        with self.lock:
+            if key not in self.devices:
+                return 401, {'error': '设备信任已撤销，请重新连接'}
+            prior = next((m for m in self.texts if m['owner'] == key
+                          and m.get('client_id') == client_id and m['direction'] == 'incoming'), None)
+            if prior:
+                if prior['text'] != text:
+                    raise ValueError('消息 ID 已用于其他内容')
+                self.save_texts()
+                self.publish()
+                return 200, {'id': prior['id'], 'ok': True}
+            message = dict(id=secrets.token_hex(16), client_id=client_id, text=text, owner=key,
+                           device=self.devices[key], direction='incoming', state='completed', time=time.time())
+            self.texts.append(message)
+            self.save_texts()
+            self.publish()
+            return 201, {'id': message['id'], 'ok': True}
+
+    def queue_text(self, device_id, text):
+        text = self.validate_text(text)
+        with self.lock:
+            self.sweep()
+            device = next((d for d in self.public_devices() if d['id'] == device_id), None)
+            if not device or not device['online']:
+                raise ValueError('手机尚未连接，请打开手机 MiDrop')
+            if not device['supports_text']:
+                raise ValueError('请将手机 MiDrop 更新到支持文字共享的版本')
+            if not device['receiving_text']:
+                raise ValueError('手机文字接收已暂停，请打开 MiDrop 或开启后台接收')
+            if sum(m['state'] == 'pending' for m in self.texts) >= 10:
+                raise ValueError('请等待当前文字发送完成')
+            owner = next(k for k in self.devices if k[:24] == device_id)
+            message = dict(id=secrets.token_hex(16), text=text, owner=owner, device=device['name'],
+                           direction='outgoing', state='pending', time=time.time(), expires=time.time()+120)
+            self.texts.append(message)
+            self.save_texts()
+            self.publish()
+            return {'id': message['id']}
+
+    def acknowledge_text(self, key, message_id):
+        with self.lock:
+            self.sweep()
+            message = next((m for m in self.texts if m['id'] == message_id
+                            and m['owner'] == key and m['direction'] == 'outgoing'), None)
+            if not message:
+                return 404, {'error': '文字消息不存在'}
+            if message['state'] not in ('pending', 'completed'):
+                return 409, {'error': '文字消息已过期或已取消'}
+            if message['state'] == 'pending':
+                message['state'] = 'completed'
+                self.save_texts()
+                self.publish()
+            return 200, {'ok': True}
 
     def pair(self, code, name):
         # Legacy API retained for already-installed 0.1 clients and regression tests.
@@ -231,6 +339,10 @@ class Receiver:
                 for job in self.jobs.values():
                     if job['owner'] == key and job['state'] not in TERMINAL:
                         job['state'] = 'cancelled'
+                for message in self.texts:
+                    if message['owner'] == key and message['state'] == 'pending':
+                        message['state'] = 'cancelled'
+                self.save_texts()
                 self.save_devices()
                 self.publish()
             return {'ok': True}
@@ -238,6 +350,13 @@ class Receiver:
     def sweep(self):
         with self.lock:
             now, dirty = time.time(), False
+            text_dirty = False
+            for message in self.texts:
+                if message['state'] == 'pending' and now > message['expires']:
+                    message['state'] = 'expired'
+                    text_dirty = dirty = True
+            if text_dirty:
+                self.save_texts()
             for p in self.pair_requests.values():
                 if now > p['expires'] and p['state'] != 'expired':
                     p['state'] = 'expired'
@@ -261,7 +380,8 @@ class Receiver:
             if dirty:
                 self.publish()
 
-    def events(self, key, receiving, wait=12, name=None):
+    def events(self, key, receiving, wait=12, name=None, text_support=False, receiving_text=False,
+               board_support=False, board_revision=None):
         with self.changed:
             if key not in self.devices:
                 return 401, {'error': '设备信任已撤销，请重新连接'}
@@ -269,8 +389,10 @@ class Receiver:
                 self.devices[key] = name[:80]
                 self.meta.setdefault(key, {})['name'] = name[:80]
                 self.save_devices()
-            initial = key not in self.sessions or self.sessions[key].get('receiving') != bool(receiving)
-            self.sessions[key] = dict(seen=time.time(), receiving=bool(receiving))
+            next_session = dict(receiving=bool(receiving), text_support=bool(text_support),
+                                receiving_text=bool(text_support and receiving_text), board_support=bool(board_support))
+            initial = key not in self.sessions or any(self.sessions[key].get(k) != v for k, v in next_session.items())
+            self.sessions[key] = dict(seen=time.time(), **next_session)
             self.publish(notify=False)
             def offers():
                 self.sweep()
@@ -279,12 +401,21 @@ class Receiver:
                         for j in self.jobs.values() if j['owner'] == key and j['direction'] == 'outgoing'
                         and j['state'] == 'waiting' and receiving]
             result = offers()
-            if not result and wait and not initial:
+            def messages():
+                return [self.public_text(m) for m in self.texts if m['owner'] == key
+                        and m['direction'] == 'outgoing' and m['state'] == 'pending'
+                        and text_support and receiving_text]
+            texts = messages()
+            if not result and not texts and wait and not initial and not (board_support and board_revision != self.board['revision']):
                 self.changed.wait(timeout=wait)
                 result = offers()
+                texts = messages()
             if key not in self.devices:
                 return 401, {'error': '设备信任已撤销，请重新连接'}
-            return 200, dict(device_id=key[:24], server_id=self.server_id, offers=result)
+            response = dict(device_id=key[:24], server_id=self.server_id, offers=result, texts=texts)
+            if board_support:
+                response['board'] = self.board
+            return 200, response
 
     def queue(self, device_id, paths):
         with self.lock:
@@ -387,6 +518,10 @@ class Receiver:
             return self.revoke(str(data.get('id')))
         if action == 'queue':
             return self.queue(str(data.get('device_id')), data.get('paths'))
+        if action == 'send_text':
+            return self.queue_text(str(data.get('device_id')), data.get('text'))
+        if action == 'update_board':
+            return self.update_board(data.get('text'), data.get('base_revision'))[1]
         if action == 'cancel':
             return self.cancel(str(data.get('id')))
         if action == 'snapshot':
@@ -447,7 +582,13 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path)
         if path.path == '/health':
             self.reply(200, dict(name=socket.gethostname(), protocol=1, api=2,
-                                server_id=self.receiver.server_id, capabilities=['trust', 'duplex']))
+                                server_id=self.receiver.server_id, capabilities=['trust', 'duplex', 'text', 'board']))
+            return
+        if path.path == '/board':
+            key = self.auth()
+            if key:
+                with self.receiver.lock:
+                    self.reply(200, {'board': self.receiver.board})
             return
         if path.path.startswith('/files/'):
             key = self.auth()
@@ -478,7 +619,7 @@ class Handler(BaseHTTPRequestHandler):
             if key:
                 self.upload(key, path, size)
             return
-        if size > 16384:
+        if size > (MAX_TEXT * 6 + 1024 if path.path in ('/texts', '/board') else 16384):
             self.reply(413, {'error': 'Request too large'})
             return
         try:
@@ -500,7 +641,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not key:
                     return
                 if path.path == '/events':
-                    self.reply(*receiver.events(key, data.get('receiving') is True, wait=12 if data.get('wait', True) else 0, name=data.get('name')))
+                    self.reply(*receiver.events(key, data.get('receiving') is True, wait=12 if data.get('wait', True) else 0,
+                                                name=data.get('name'), text_support=data.get('text_support') is True,
+                                                receiving_text=data.get('receiving_text') is True,
+                                                board_support=data.get('board_support') is True, board_revision=data.get('board_revision')))
+                elif path.path == '/board':
+                    self.reply(*receiver.update_board(data.get('text'), data.get('base_revision'), key))
+                elif path.path == '/texts':
+                    self.reply(*receiver.receive_text(key, data))
+                elif re.fullmatch(r'/texts/[a-f0-9]{32}/ack', path.path):
+                    self.reply(*receiver.acknowledge_text(key, path.path.split('/')[2]))
                 elif path.path.startswith('/offers/'):
                     parts = path.path.split('/')
                     if len(parts) != 4:

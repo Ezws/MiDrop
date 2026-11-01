@@ -1,0 +1,19 @@
+{
+  "android_api": 36,
+  "passed": [
+    "foreground and background Mac-to-phone text delivery",
+    "exact Unicode, emoji, whitespace and newline preservation",
+    "repeated delivery stored once",
+    "notification detail with copy and HTTP link action",
+    "Android ACTION_SEND plain-text upload",
+    "text receipt with notification permission denied",
+    "manual compose dialog and send button",
+    "pause preserves text capability and blocks new background delivery",
+    "foreground text receipt with background receiving disabled",
+    "bidirectional private text history",
+    "no txt files or MediaStore rows created"
+  ],
+  "not_verified": [
+    "physical REDMI / HyperOS"
+  ]
+}

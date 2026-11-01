@@ -7,15 +7,15 @@
 <key>CFBundleExecutable</key><string>MiDropShare</string>
 <key>CFBundleIconFile</key><string>MiDrop.icns</string>
 <key>CFBundlePackageType</key><string>XPC!</string>
-<key>CFBundleVersion</key><string>4</string>
-<key>CFBundleShortVersionString</key><string>0.2.2</string>
+<key>CFBundleVersion</key><string>7</string>
+<key>CFBundleShortVersionString</key><string>0.4.0</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSExtension</key><dict>
     <key>NSExtensionPointIdentifier</key><string>com.apple.share-services</string>
     <key>NSExtensionPrincipalClass</key><string>ShareViewController</string>
     <key>NSExtensionAttributes</key><dict>
         <key>NSExtensionActivationRule</key>
-        <string>extensionItems.@count &gt; 0 AND SUBQUERY(extensionItems, $item, $item.attachments.@count &gt; 0 AND SUBQUERY($item.attachments, $attachment, ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.file-url").@count == $item.attachments.@count).@count == extensionItems.@count</string>
+        <string>extensionItems.@count &gt; 0 AND (SUBQUERY(extensionItems, $item, $item.attachments.@count &gt; 0 AND SUBQUERY($item.attachments, $attachment, ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.file-url").@count == $item.attachments.@count).@count == extensionItems.@count OR SUBQUERY(extensionItems, $item, $item.attachments.@count &gt; 0 AND SUBQUERY($item.attachments, $attachment, NOT ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.file-url" AND (ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.url" OR ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.plain-text")).@count == $item.attachments.@count).@count == extensionItems.@count)</string>
     </dict>
 </dict>
 </dict></plist>

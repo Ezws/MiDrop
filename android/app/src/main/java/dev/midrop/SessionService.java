@@ -32,9 +32,10 @@ public class SessionService extends Service {
     private NotificationManager manager;
 
     private boolean canReceive() {
-        return (MainActivity.visible || Protocol.prefs(this).getBoolean("background_receive",true))
+        return canReceiveText()
             && (Build.VERSION.SDK_INT>=29 || checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)==PackageManager.PERMISSION_GRANTED);
     }
+    private boolean canReceiveText() { return MainActivity.visible || Protocol.prefs(this).getBoolean("background_receive",true); }
     static void start(Context c) {
         if (!Protocol.prefs(c).getString("token","").isEmpty() && (MainActivity.visible || Protocol.prefs(c).getBoolean("background_receive",true)))
             c.startForegroundService(new Intent(c,SessionService.class).setAction("START"));
@@ -56,6 +57,7 @@ public class SessionService extends Service {
     @Override public void onCreate() {
         super.onCreate(); instance=this;
         manager=(NotificationManager)getSystemService(NOTIFICATION_SERVICE);
+        manager.cancel(83);
         manager.createNotificationChannel(new NotificationChannel("connection","后台连接",NotificationManager.IMPORTANCE_LOW));
         // Remove obsolete per-batch confirmation notifications on upgrade.
         manager.deleteNotificationChannel("incoming");
@@ -101,13 +103,19 @@ public class SessionService extends Service {
         while (running) {
             HttpsURLConnection c=null;
             try {
+                BoardStore.ensureServer(this);
+                syncBoardDraft();
                 boolean ready=canReceive();
-                JSONObject body=new JSONObject().put("receiving",ready).put("name",Protocol.deviceName(this));
+                JSONObject body=new JSONObject().put("receiving",ready).put("name",Protocol.deviceName(this))
+                    .put("board_support",true).put("board_revision",BoardStore.revision(this));
                 c=Protocol.authenticated(this,"/events"); pollConnection=c;
                 JSONObject result=Protocol.post(c,body);
                 if (!running) break;
                 Protocol.prefs(this).edit().putString("device_id",result.getString("device_id")).putString("server_id",result.getString("server_id"))
                     .putBoolean("connected",true).putString("connection_error","").apply();
+                JSONObject board=result.optJSONObject("board");
+                if (board!=null) BoardStore.receive(this,board);
+                else Protocol.prefs(this).edit().putBoolean("board_capable",false).apply();
                 JSONArray offers=result.getJSONArray("offers");
                 for (int i=0;i<offers.length();i++) {
                     JSONObject offer=offers.getJSONObject(i); String id=offer.getString("id");
@@ -119,7 +127,7 @@ public class SessionService extends Service {
                     }
                 }
                 if (SystemClock.elapsedRealtime()-lastNotice>15000) {
-                    manager.notify(CONNECTION,connectionNotice(ready?"已连接 · 自动接收文件":"已连接 · 接收已暂停，请打开 MiDrop 检查设置和保存权限"));
+                    manager.notify(CONNECTION,connectionNotice("已连接 · 公告板自动同步"));
                     lastNotice=SystemClock.elapsedRealtime();
                 }
                 // Waiting offers make /events return immediately. Avoid a hot
@@ -131,6 +139,22 @@ public class SessionService extends Service {
                 Protocol.prefs(this).edit().putBoolean("connected",false).putString("connection_error",error instanceof Protocol.ApiException && ((Protocol.ApiException)error).code==401?"此设备的信任已撤销，请重新连接":"正在寻找你的 Mac").apply();
                 try { Thread.sleep(2500); } catch (InterruptedException e) { break; }
             } finally { if (c!=null) c.disconnect(); pollConnection=null; }
+        }
+    }
+    private void syncBoardDraft() throws Exception {
+        BoardStore.Draft draft;
+        try { draft=BoardStore.pending(this); }
+        catch (IOException error) { Protocol.prefs(this).edit().putString("board_error",error.getMessage()).apply(); return; }
+        if (draft==null) return;
+        try {
+            JSONObject response=Protocol.post(this,"/board",new JSONObject().put("text",draft.text).put("base_revision",draft.base));
+            BoardStore.acknowledged(this,draft,response.getJSONObject("board"));
+        } catch (Protocol.ApiException error) {
+            if (error.code==409 && error.payload.optJSONObject("board")!=null) {
+                BoardStore.conflict(this,draft,error.payload.getJSONObject("board")); return;
+            }
+            Protocol.prefs(this).edit().putString("board_error",error.getMessage()).apply();
+            throw error;
         }
     }
     private void receiveAutomatically(JSONObject offer) {
@@ -257,7 +281,8 @@ public class SessionService extends Service {
         running=false; cancelReceive=true;
         if (pollConnection!=null) pollConnection.disconnect(); if (downloadConnection!=null) downloadConnection.disconnect();
         if (poller!=null) poller.interrupt();
-        new Thread(() -> { try { Protocol.post(this,"/events",new JSONObject().put("receiving",false).put("wait",false)); } catch (Exception ignored) {} }).start();
+        new Thread(() -> { try { Protocol.post(this,"/events",new JSONObject().put("receiving",false).put("wait",false)
+            .put("board_support",false)); } catch (Exception ignored) {} }).start();
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf();
     }
     @Override public void onDestroy() {

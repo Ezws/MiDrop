@@ -96,13 +96,11 @@ public class TransferService extends Service {
             String token = Protocol.prefs(this).getString("token", "");
             if (pin.length() != 64 || token.isEmpty()) throw new IOException("请先配对 Mac");
             ArrayList<Uri> items = uris(intent);
-            CharSequence text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT);
             int total = items.size();
-            if (total == 0 && text == null) throw new IOException("没有收到可读取的文件");
-            if (total == 0) total = 1;
+            if (total == 0) throw new IOException("请选择文件；文字可直接写在公告板");
             for (int index = 0; index < total; index++) {
                 checkCancelled();
-                String name = items.isEmpty() ? "分享文字-" + System.currentTimeMillis() + ".txt" : filename(items.get(index), index + 1);
+                String name = filename(items.get(index), index + 1);
                 String prefix = "(" + (index + 1) + "/" + total + ") ";
                 File staged = File.createTempFile("midrop-", ".part", getCacheDir());
                 try {
@@ -110,7 +108,7 @@ public class TransferService extends Service {
                     report("正在准备 · "+prefix+name,-1);
                     MessageDigest digest = MessageDigest.getInstance("SHA-256");
                     long size = 0;
-                    InputStream source = items.isEmpty() ? new ByteArrayInputStream(text.toString().getBytes("UTF-8")) : getContentResolver().openInputStream(items.get(index));
+                    InputStream source = getContentResolver().openInputStream(items.get(index));
                     if (source == null) throw new IOException("无法读取文件：" + name);
                     try (InputStream input = source; OutputStream output = new FileOutputStream(staged)) {
                         byte[] buffer = new byte[256 * 1024];
@@ -153,8 +151,11 @@ public class TransferService extends Service {
             }
             result = "已发送 " + completed + " 个文件到 Mac";
         } catch (Exception error) {
-            result = (cancelled ? "已取消" : "发送失败：" + (error.getMessage() == null ? error.toString() : error.getMessage())) + " · 已完成 " + completed + " 个";
+            String reason=error instanceof Protocol.ApiException && ((Protocol.ApiException)error).code==404 && currentName.equals("文字与链接")
+                ? "请将 Mac MiDrop 更新到支持文字共享的版本" : error.getMessage() == null ? error.toString() : error.getMessage();
+            result = (cancelled ? "已取消" : "发送失败：" + reason) + " · 已完成 " + completed + " 个";
         } finally {
+            if (connection!=null) { connection.disconnect(); connection=null; }
             if (wake != null && wake.isHeld()) wake.release();
         }
         final String finalResult = result;

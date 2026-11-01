@@ -95,12 +95,13 @@ final class Protocol {
             }
         }
         JSONObject json = new JSONObject(bytes.toString("UTF-8"));
-        if (code < 200 || code >= 300) throw new ApiException(code,json.optString("error","请求失败"));
+        if (code < 200 || code >= 300) throw new ApiException(code,json.optString("error","请求失败"),json);
         return json;
     }
     static class ApiException extends IOException {
         final int code;
-        ApiException(int code,String message) { super(message); this.code=code; }
+        final JSONObject payload;
+        ApiException(int code,String message,JSONObject payload) { super(message); this.code=code; this.payload=payload; }
     }
     static void progress(Context c, String direction, String state, String name, long bytes, long size, String message) {
         prefs(c).edit().putString("transfer_direction",direction).putString("transfer_state",state)

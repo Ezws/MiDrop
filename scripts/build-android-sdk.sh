@@ -34,7 +34,7 @@ PY
 "$TOOLS/aapt2" compile --dir "$PROJECT_ROOT/android/app/src/main/res" -o "$BUILD/resources.zip"
 "$TOOLS/aapt2" link -o "$BUILD/resources.apk" -I "$PLATFORM" \
   --manifest "$BUILD/AndroidManifest.xml" --java "$BUILD/generated" \
-  --min-sdk-version 26 --target-sdk-version 35 --version-code 4 --version-name 0.2.2 \
+  --min-sdk-version 26 --target-sdk-version 35 --version-code 6 --version-name 0.4.0 \
   "$BUILD/resources.zip"
 find "$PROJECT_ROOT/android/app/src/main/java" "$BUILD/generated" -name '*.java' > "$BUILD/sources.txt"
 "$JAVA_BIN/javac" -encoding UTF-8 --release 8 -classpath "$PLATFORM" \

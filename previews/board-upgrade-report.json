@@ -1,0 +1,5 @@
+{
+  "upgrade": "same-signer Android 0.2.2 versionCode 4 -> 0.4.0 versionCode 6",
+  "private_preferences_unchanged": true,
+  "preferences_sha256": "f511cb7a9d699ae3def01a50916f34f8a46371b116721e9c650cabd7e968839c"
+}

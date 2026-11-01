@@ -1,10 +1,11 @@
-# MiDrop 0.2 协议
+# MiDrop 0.4 协议
 
 Mac 为唯一网络监听端，提供 TLS 1.2+ HTTPS。手机主动连接。Bonjour 发布 `_midrop._tcp.`，TXT 中的 `id` 为 Mac 证书 SHA-256 前 24 位，仅作发现标识，不能代替完整证书验证。
 
 ## 身份与兼容
 
 - `GET /health` 返回兼容旧版的 `protocol: 1`，新增 `api: 2`、`server_id` 与能力列表。
+- 0.3.0 在能力列表中加入 `text`；原文件接口和 API 版本保持兼容。
 - `devices.json` 保留原来的令牌哈希 → 设备名称结构，不写入原始令牌；新设备元数据单独保存在 `device_meta.json`。
 - `POST /pair` 保留旧版接口，供兼容和回归测试；新版 UI 不展示配对码。
 - 新版初次只探测证书和提交请求；Mac 本机批准后，手机取得令牌并固定此前完整证书指纹。请求名称为对端声明，不是账号认证。
@@ -30,13 +31,24 @@ Mac 为唯一网络监听端，提供 TLS 1.2+ HTTPS。手机主动连接。Bonj
 
 传输状态统一为 preparing、waiting、accepted、transferring、completed、rejected、cancelled、expired、failed。已接受但五分钟无进展的批次失败，不自动续传。
 
+## 共享公告板
+
+- 全体已配对设备共享同一个当前文档，不需要收件设备，也不产生消息历史。UTF-8 上限 64 KiB，允许空内容用于同步清空；中文、emoji、空格、换行原样保存。
+- `GET /board`：已认证手机读取当前 `{text, revision, updated}`。
+- `POST /board`：提交 `{text, base_revision}`。Mac 本机 Socket 对应 `{action:"update_board",text,base_revision}`，无需 device_id。正文相同时幂等返回当前版本；正文不同且版本过期时返回 409 和当前 board，不覆盖新内容。成功更新持久化后递增 revision，并唤醒等待中的所有已配对客户端。
+- `/events` 请求增加 `board_support:true` 和客户端已知 `board_revision`，响应包含当前 board。已知版本相同且无文件事件时正常长轮询；版本不同立即返回。公告板不受文件接收开关或保存权限影响，只需保持已认证连接。客户端停止后台连接后不再实时更新，重连自动读取最新版本。
+- 客户端编辑停顿约 0.6 秒后自动更新。未同步草稿保留；收到新版本时不覆盖本地脏草稿。陈旧写入冲突后保留草稿并暂停自动覆盖，用户可使用远端内容，或继续编辑以最新版本为基准同步。
+- Mac 仅保存当前 `board.json` 和有待同步时的 `board-draft.json`（0600）；Android 在私有偏好保存当前文档与待同步草稿。没有公告板历史队列、逐条投递确认或 120 秒消息过期。
+- 链接作为普通文字；只有完整 HTTP/HTTPS 地址提供显式打开入口，不自动改写剪贴板或启动浏览器。
+- 0.3 旧版 `/texts` 消息接口暂保留兼容，0.4 界面与同步服务不使用它、不展示或自动广播旧文字记录。
+
 ## 本机边界与保存
 
 `~/Library/Application Support/MiDrop` 权限 0700；私钥、凭据、状态和 `control.sock` 权限 0600。
 
-Unix Socket 接受一行 JSON，支持 snapshot、approve、queue、revoke、cancel。状态快照不包含 ticket、原始令牌或可直接授权的秘密。
+Unix Socket 接受一行 JSON，支持 snapshot、approve、queue、update_board、revoke、cancel（兼容旧 send_text）。状态快照不包含 ticket、原始令牌或可直接授权的秘密。
 
-Mac 共享扩展运行于独立沙盒，只接收宿主提供的本地文件 URL，通过 Launch Services 交给主 App。扩展不读取凭据或连接控制 Socket；主 App 将文件暂存在待发送列表，用户选择手机并点击发送后才调用原有 `queue` 操作。主 App 声明接收 `public.data` 文档以允许沙盒扩展交接，`LSHandlerRank=None` 不参与默认打开方式的选择。
+Mac 共享扩展运行于独立沙盒，通过 Launch Services 交给主 App：文件 URL 使用文档打开事件；纯文本和网页链接使用 `midrop://share-text?text=…` URL（64 KiB 上限）。扩展不读取凭据或连接控制 Socket；文件在主 App 中暂存并选择手机发送；文字/链接直接写入共享公告板后自动同步。文件与文字混合选择不激活扩展。主 App 声明接收 `public.data` 文档以允许沙盒扩展交接，`LSHandlerRank=None` 不参与默认打开方式的选择。
 
 Mac 临时文件完整接收和校验后，使用不可覆盖的原子硬链接提交到下载目录。Android 10+ 先写入 `IS_PENDING=1` 的 MediaStore 条目，长度与 SHA-256 符合后才发布；取消或失败则删除条目，进程异常退出后下次启动清理记录的未完成条目。
 
