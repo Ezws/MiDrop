@@ -103,28 +103,23 @@ def main():
         time.sleep(1); capture('android-light.png')
         adb('shell','cmd','uimode','night','yes'); time.sleep(1.5); capture('android-dark.png')
         adb('shell','cmd','uimode','night','no'); time.sleep(1)
-        # Download consent, zero bytes, Unicode, multiple files, 32 MiB content.
+        # Automatic foreground receipt: no dialog or DECIDE action is delivered.
         files=RUNTIME/'source'; files.mkdir(exist_ok=True)
         (files/'空文件.txt').write_bytes(b'')
         (files/'照片与文件-测试.bin').write_bytes(bytes(range(256))*1024)
         with (files/'视频测试-32MiB.bin').open('wb') as f:
             for _ in range(32): f.write(b'Q'*1024*1024)
         jid=control({'action':'queue','device_id':device['id'],'paths':[str(files/n) for n in ['空文件.txt','照片与文件-测试.bin','视频测试-32MiB.bin']]})['id']
-        wait(lambda: job(jid)['state']=='waiting'); time.sleep(1.5)
-        # Consent is deliberately not delivered yet: no visible file may be published.
-        assert pref('last_received_uri')==''
-        capture('android-consent.png')
+        wait(lambda: job(jid)['state']=='completed',120)
+        wait(lambda: pref('transfer_state')=='completed',10)
         if '--visual-only' in sys.argv:
             adb('shell','settings','put','system','font_scale','1.3'); time.sleep(1.5)
             capture('android-large-font.png')
             adb('shell','settings','put','system','font_scale','1.0'); time.sleep(1)
-        # Exercise the same non-exported service action used by the notification button.
-        adb('shell','am','start-foreground-service','-n',APP+'/.SessionService','-a','DECIDE','--es','id',jid,'--ez','accept','true')
-        wait(lambda: job(jid)['state']=='completed',120)
-        wait(lambda: pref('transfer_state')=='completed',10)
         if '--visual-only' in sys.argv:
+            time.sleep(.75)  # Let MainActivity's 500 ms progress refresh render completion.
             capture('android-completed.png')
-            report={'android_api':36,'passed':['latest APK light/dark actual renders','rounded receive prompt','1.3x font scale render','accept action and MediaStore completion']}
+            report={'android_api':36,'passed':['latest APK light/dark actual renders','1.3x font scale render','automatic receipt and MediaStore completion']}
             (PREVIEWS/'android-visual-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
             print(json.dumps(report,ensure_ascii=False,indent=2)); return
         rows=adb('shell','content','query','--uri','content://media/external/downloads','--projection','_id:_display_name:is_pending')
@@ -139,43 +134,63 @@ def main():
         wait(lambda: pref('transfer_state')=='completed',20)
         # A second received copy must keep the first MediaStore row/file intact.
         duplicate=control({'action':'queue','device_id':device['id'],'paths':[str(files/'视频测试-32MiB.bin')]})['id']
-        wait(lambda: job(duplicate)['state']=='waiting'); time.sleep(1)
-        adb('shell','am','start-foreground-service','-n',APP+'/.SessionService','-a','DECIDE','--es','id',duplicate,'--ez','accept','true')
         wait(lambda: job(duplicate)['state']=='completed',120)
         wait(lambda: pref('transfer_state')=='completed',10)
+        time.sleep(.75)
         capture('android-completed.png')
         # Throttle only this disposable emulator, then cancel an active receive.
         adb('emu','network','speed','1024')
         try:
             cancelled=control({'action':'queue','device_id':device['id'],'paths':[str(files/'视频测试-32MiB.bin')]})['id']
-            wait(lambda: job(cancelled)['state']=='waiting'); time.sleep(1)
-            adb('shell','am','start-foreground-service','-n',APP+'/.SessionService','-a','DECIDE','--es','id',cancelled,'--ez','accept','true')
             wait(lambda: job(cancelled)['state']=='transferring' and job(cancelled)['bytes']>0,40)
             adb('shell','am','start-foreground-service','-n',APP+'/.SessionService','-a','CANCEL')
             wait(lambda: pref('transfer_state')=='cancelled',30)
             assert 'is_pending=1' not in adb('shell','content','query','--uri','content://media/external/downloads','--projection','_id:is_pending')
         finally:
             adb('emu','network','speed','full')
-        # Reject from the background using the notification's action, without a download.
+        # Several batches arriving together must drain automatically, once each.
+        before_rows=adb('shell','content','query','--uri','content://media/external/downloads','--projection','_id:is_pending')
+        batches=[control({'action':'queue','device_id':device['id'],'paths':[str(files/'空文件.txt')]})['id'] for _ in range(3)]
+        wait(lambda: all(job(batch)['state']=='completed' for batch in batches),60)
+        after_rows=adb('shell','content','query','--uri','content://media/external/downloads','--projection','_id:is_pending')
+        assert after_rows.count('Row:')==before_rows.count('Row:')+3,(before_rows,after_rows)
+        # Background receipt must work without tapping a notification.
         adb('shell','am','start','-a','android.intent.action.MAIN','-c','android.intent.category.HOME')
-        denied=control({'action':'queue','device_id':device['id'],'paths':[str(files/'空文件.txt')]})['id']
-        wait(lambda: job(denied)['state']=='waiting'); time.sleep(1)
-        adb('shell','am','start-foreground-service','-n',APP+'/.SessionService','-a','DECIDE','--es','id',denied,'--ez','accept','false')
-        wait(lambda: job(denied)['state']=='rejected')
-        # Disable notifications while backgrounded: Mac must mark receiving unavailable.
+        background=control({'action':'queue','device_id':device['id'],'paths':[str(files/'照片与文件-测试.bin')]})['id']
+        wait(lambda: job(background)['state']=='completed',60)
+        # Notification permission affects visibility, not automatic receipt.
         adb('shell','pm','revoke',APP,'android.permission.POST_NOTIFICATIONS')
-        wait(lambda: not next(d for d in snapshot()['trusted_devices'] if d['id']==device['id'])['receiving'],75)
+        # Android kills the process when a runtime permission is revoked.
+        # Reconnect while permission remains denied, then background the app.
+        adb('shell','am','start','-n',APP+'/.MainActivity')
+        wait(lambda: pref('connected')=='true',30)
+        adb('shell','am','start','-a','android.intent.action.MAIN','-c','android.intent.category.HOME')
+        silent=control({'action':'queue','device_id':device['id'],'paths':[str(files/'照片与文件-测试.bin')]})['id']
+        wait(lambda: job(silent)['state']=='completed',60)
+        assert next(d for d in snapshot()['trusted_devices'] if d['id']==device['id'])['receiving']
         adb('shell','pm','grant',APP,'android.permission.POST_NOTIFICATIONS')
+        # Pausing still blocks background receipt; foreground remains available.
+        adb('shell','am','start-foreground-service','-n',APP+'/.SessionService','-a','STOP')
+        wait(lambda: not next(d for d in snapshot()['trusted_devices'] if d['id']==device['id'])['receiving'],30)
+        try:
+            control({'action':'queue','device_id':device['id'],'paths':[str(files/'空文件.txt')]})
+            raise AssertionError('Paused background receiver accepted a batch')
+        except AssertionError as error:
+            assert '手机当前不可接收' in str(error),error
         adb('shell','am','start','-n',APP+'/.MainActivity')
         wait(lambda: next(d for d in snapshot()['trusted_devices'] if d['id']==device['id'])['receiving'],40)
+        foreground=control({'action':'queue','device_id':device['id'],'paths':[str(files/'空文件.txt')]})['id']
+        wait(lambda: job(foreground)['state']=='completed',60)
         capture('android-after-tests.png')
         log=adb('logcat','-d','-s','AndroidRuntime:E')
         assert 'FATAL EXCEPTION' not in log,log
         report={'android_api':36,'device':'Disposable AOSP ATD arm64 emulator','passed':[
             'APK installation and foreground service startup','light and dark UI render',
-            'no files published before consent','accepted multi-file + zero-byte + Unicode + 32 MiB download',
+            'automatic foreground multi-file + zero-byte + Unicode + 32 MiB download',
             'SHA-256 verified Android upload back to Mac','duplicate receipt does not overwrite',
-            'active receive cancellation removes unpublished file','background rejection','notifications denied marks receiver unavailable'],
+            'active receive cancellation removes unpublished file','consecutive batches received once each',
+            'automatic background receipt','background receipt with notifications denied',
+            'paused background receiver unavailable; foreground automatic receipt still works'],
             'not_verified':['physical REDMI Turbo 4 Pro','HyperOS background kill policy','Bonjour on a physical Wi-Fi network']}
         (PREVIEWS/'android-qa-report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
         print(json.dumps(report,ensure_ascii=False,indent=2))

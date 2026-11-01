@@ -1,0 +1,5 @@
+{
+  "upgrade": "Android 0.2.1 versionCode 3 -> 0.2.2 versionCode 4",
+  "private_preferences_unchanged": true,
+  "preferences_sha256": "51ffe41372e7c8dc83f10b31f4d27432eb15ba1d98a6c288e1f6780ce37911c9"
+}

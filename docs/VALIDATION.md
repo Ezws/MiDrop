@@ -1,5 +1,25 @@
 # MiDrop 0.2 验证记录
 
+## Android 0.2.2 自动接收（2026-11-01）
+
+- 已配对且连接、接收开启并具备保存权限时，手机自动完成接收握手，不再弹出前台确认框或后台接收/拒绝通知。后台接收关闭后仅前台接收；取消传输入口保留。通知权限不再决定能否接收。
+- 独立 Android 16 / API 36 模拟器端到端验证通过：前台自动接收多文件、中文名、空文件和 32 MiB 内容；通过真实 MediaStore URI 回传 Mac 后 SHA-256 一致；重名文件保留副本。
+- 同时发起的三个批次自动依次完成，MediaStore 恰好新增三个条目；后台自动接收、通知权限拒绝后重新连接并退到后台接收均通过。Android 撤销运行时权限会终止应用进程，测试在权限仍拒绝的情况下重新连接，没有把进程终止误判为接收逻辑失败。
+- 传输中取消后，未发布的 MediaStore 条目已清理；暂停后台接收后 Mac 标记不可接收并拒绝新队列，重新打开手机 App 后恢复前台自动接收。
+- 25 项协议回归测试通过，服务端仍要求所属设备先完成 accept 握手才允许下载；新手机端自动执行此握手。设备授权、固定证书指纹和内容校验保持有效。
+- APK 版本为 0.2.2 / versionCode 4，v2/v3 签名与 zipalign 验证通过，签名证书与 0.2.1 一致；模拟器从 0.2.1 覆盖升级后，完整私有偏好文件逐字节不变。两套 Android 构建版本已同步。
+- 本轮没有连接真实手机，未覆盖安装用户的 REDMI；HyperOS 后台存活与真实网络仍需真机验证。产物为 `dist/MiDrop-android.apk`，可覆盖安装，保留原有配对。
+- 原始结果：`previews/android-qa-report.json`、`previews/android-auto-receive-upgrade-report.json`。`scripts/emulator-smoke.py` 已更新为自动接收回归检查。
+
+## Mac 0.2.2 Finder 共享入口（2026-11-01）
+
+- 构建并嵌入沙盒共享扩展，系统 PlugInKit 已注册并启用 `dev.midrop.mac.ShareExtension`；主 App 和扩展的嵌套代码签名验证通过。
+- 在本机 Finder 实际验证「右键 → 共享 → MiDrop」：单张 JPEG、三张 PNG/JPEG 均能打开独立发送窗口，中文文件名、选择顺序和数量完整保留；取消后待发送列表清空。
+- MiDrop 主进程未运行时，选择共享能自动启动应用，三个文件均保留；手机离线时发送按钮禁用，文件留在列表等待连接。窗口在 Finder 共享面板关闭后仍保持可见。
+- `bash scripts/test-mac-share.sh` 通过：系统能为图片、压缩包、空二进制文件和多文件提供 MiDrop；激活规则拒绝空选择、网页链接、纯文本和夹带不支持项目的组合。
+- 25 项协议回归测试通过。已更新并运行本机 `dist/MiDrop.app`；升级前后设备凭据与设备元数据的 SHA-256 一致。
+- 本轮验证到发送前的文件交接与取消，没有向真实手机发送测试文件；真实手机确认与接收仍沿用现有传输流程。仅验证 Finder 提供的本地文件 URL，不宣称支持其他应用导出的临时照片或网页内容。
+
 ## Mac 0.2.1 常驻 CPU 优化（2026-10-24）
 
 - 移除每 0.6 秒读取状态并刷新 SwiftUI 的定时器，改用目录文件系统通知，兼容 `state.json` 的多次原子替换。
@@ -58,7 +78,7 @@
 ## 可复现材料
 
 - `tests/test_receiver.py`：协议、授权边界、隔离、反向传输、校验与恢复。
-- `scripts/emulator-smoke.py`：仅允许 `emulator-5556` 的独立测试；真实 App 下载、上传、拒绝、取消和通知权限验证。
+- `scripts/emulator-smoke.py`：仅允许 `emulator-5556` 的独立测试；真实 App 自动下载、上传、连续批次、取消、暂停和通知权限验证。
 - `scripts/emulator-smoke.py --visual-only`：只复查最终 UI 和接收动作，生成明暗与大字体截图。
 - `scripts/build-qa-instrumentation.sh`、`scripts/emulator-trust-smoke.py`：单独构建测试 APK，不向正式 App 加入测试入口。
 - `scripts/emulator-upgrade-smoke.py`：只在独立模拟器验证 0.1 → 0.2 覆盖升级。

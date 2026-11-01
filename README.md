@@ -15,7 +15,7 @@ cd ~/Codes/MiDrop
 
 ## 安装与升级
 
-- Mac 当前版本为 **0.2.1**：状态变化时才刷新界面，降低常驻待机 CPU。Android 为 **0.2.1**（versionCode 3）：修复右上角三点菜单在部分字体下只显示一个点的问题。
+- Mac 当前版本为 **0.2.2**：新增 Finder「右键 → 共享 → MiDrop」，支持多文件并可自动启动应用；保留 0.2.1 的低待机 CPU 优化。Android 为 **0.2.2**（versionCode 4）：已配对且连接时自动接收文件，无需逐次确认。
 - Mac：打开 `dist/MiDrop.app`，菜单栏会出现新的双弧标识。点击它展开小面板。
 - 手机：安装 `dist/MiDrop-android.apk`，覆盖原版即可。**不需要卸载，也不要清除应用数据。**
 - 原有证书、配对凭据和 Android 签名密钥已保留。新连接流程和双向传输需要两端都更新到 0.2。
@@ -26,7 +26,7 @@ cd ~/Codes/MiDrop
 1. 两台设备连接同一 Wi-Fi / 局域网，打开 Mac 菜单栏 MiDrop。
 2. 手机打开 MiDrop，点击发现的 Mac。
 3. Mac 小面板出现手机请求，点击 **允许并记住**。不需要输入配对码。
-4. 手机按提示允许通知，以便在后台确认接收；在设置中可暂停后台接收。
+4. 手机可按提示允许通知，查看接收进度和完成提示；在设置中可暂停后台接收。
 
 已连接过的手机升级后会继续使用原凭据。证书或设备信任被清除时，需要重新允许连接。
 
@@ -38,11 +38,11 @@ cd ~/Codes/MiDrop
 
 ## Mac 发送到手机
 
-在菜单栏 MiDrop 小面板选择在线手机，拖入文件，或点击拖入区域选择文件。手机收到请求后：
+在 Finder 中选择一个或多个文件 → **右键 → 共享 → MiDrop**，在打开的发送窗口选择手机，点击 **发送到手机**。MiDrop 未运行时会自动启动；手机离线时文件会留在待发送列表，连接后可发送。首次安装如果没有显示 MiDrop，请在共享菜单的「编辑扩展…」中启用。
 
-- App 在前台：显示接收弹层。
-- App 在后台：显示系统通知，点击 **接收 / 拒绝**。
-- 每批文件均需手机确认，确认前不下载文件内容；两分钟未处理会过期。
+也可以在菜单栏 MiDrop 小面板选择在线手机，拖入文件，或点击拖入区域选择文件。已配对且连接中的手机会自动接收，前台和后台都无需逐次确认；多个批次依次接收。传输中仍可取消。
+
+后台接收默认开启。关闭后，仅在手机打开 MiDrop 时接收；手机离线、后台接收暂停或旧版 Android 缺少保存权限时，Mac 不会发起新传输。通知权限影响提示显示，不影响连接中的自动接收。两分钟内未被接收端接手的批次仍会过期。
 
 手机保存位置为 **Download/MiDrop**，可在系统文件管理器查看，也可从 MiDrop 设置打开最近收到的文件。
 
@@ -100,5 +100,7 @@ PYTHONPYCACHEPREFIX=/private/tmp/midrop-pycache python3 -m unittest discover -s 
 `previews/` 提供 Mac 明暗主题原生界面渲染及 Android 实际测试截图；具体结果与待验证项目见 `docs/VALIDATION.md`。图标母版为 `assets/logo.svg`。
 
 Mac 状态监听测试：`bash scripts/test-mac-state-monitor.sh`。`previews/mac-idle-cpu-report.json` 记录同机空闲 CPU 对比；短时间采样不代表长期平均能耗。
+
+Mac 共享扩展检查：先打开构建后的 App 并启用 MiDrop 共享扩展，再运行 `bash scripts/test-mac-share.sh`。该检查覆盖激活规则，以及系统对图片、压缩包、二进制和多文件的共享入口识别；实际 Finder 点击流程见验证记录。
 
 `docs/PROTOCOL.md` 记录 API 与本机控制边界。源码结构为 `mac/`、`android/app/`、`assets/`、`scripts/` 和 `tests/`。

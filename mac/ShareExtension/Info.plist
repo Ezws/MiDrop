@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.midrop.mac.ShareExtension</string>
+<key>CFBundleName</key><string>MiDrop</string>
+<key>CFBundleDisplayName</key><string>MiDrop</string>
+<key>CFBundleExecutable</key><string>MiDropShare</string>
+<key>CFBundleIconFile</key><string>MiDrop.icns</string>
+<key>CFBundlePackageType</key><string>XPC!</string>
+<key>CFBundleVersion</key><string>4</string>
+<key>CFBundleShortVersionString</key><string>0.2.2</string>
+<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>NSExtension</key><dict>
+    <key>NSExtensionPointIdentifier</key><string>com.apple.share-services</string>
+    <key>NSExtensionPrincipalClass</key><string>ShareViewController</string>
+    <key>NSExtensionAttributes</key><dict>
+        <key>NSExtensionActivationRule</key>
+        <string>extensionItems.@count &gt; 0 AND SUBQUERY(extensionItems, $item, $item.attachments.@count &gt; 0 AND SUBQUERY($item.attachments, $attachment, ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.file-url").@count == $item.attachments.@count).@count == extensionItems.@count</string>
+    </dict>
+</dict>
+</dict></plist>

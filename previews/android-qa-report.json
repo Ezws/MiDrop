@@ -4,13 +4,14 @@
   "passed": [
     "APK installation and foreground service startup",
     "light and dark UI render",
-    "no files published before consent",
-    "accepted multi-file + zero-byte + Unicode + 32 MiB download",
+    "automatic foreground multi-file + zero-byte + Unicode + 32 MiB download",
     "SHA-256 verified Android upload back to Mac",
     "duplicate receipt does not overwrite",
     "active receive cancellation removes unpublished file",
-    "background rejection",
-    "notifications denied marks receiver unavailable"
+    "consecutive batches received once each",
+    "automatic background receipt",
+    "background receipt with notifications denied",
+    "paused background receiver unavailable; foreground automatic receipt still works"
   ],
   "not_verified": [
     "physical REDMI Turbo 4 Pro",

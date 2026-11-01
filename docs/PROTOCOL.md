@@ -22,9 +22,9 @@ Mac 为唯一网络监听端，提供 TLS 1.2+ HTTPS。手机主动连接。Bonj
 
 - `POST /events`：提交是否可接收，记录在线状态，长轮询返回本设备待接收批次。最后心跳超过 60 秒视为离线。
 - `POST /upload?name=…`：手机发送原始字节；长度及 `X-Content-SHA256` 必填，`X-Transfer-ID` 可指定取消标识。旧版未携带标识时服务端自动生成。
-- 本机 `queue` 操作：选择可信且可接收的手机，异步预校验文件并创建批次，准备完成后等待确认 120 秒。
-- `POST /offers/{id}/decision`：本设备 accept / reject。确认前不能获取文件内容。
-- `GET /files/{batch}/{file}`：只能由批次所属设备，在已确认且未结束时下载。服务端再次检查源文件大小和修改时间。
+- 本机 `queue` 操作：选择可信且可接收的手机，异步预校验文件并创建批次，准备完成后等待接收端接手，120 秒过期。
+- `POST /offers/{id}/decision`：本设备 accept / reject。Android 0.2.2 在已配对且连接、接收开启且具备保存权限时自动发送 accept，无需用户逐次确认；串行接收批次，后台关闭后只在前台接收。通知权限不作为接收条件。保留 reject 以兼容旧客户端。
+- `GET /files/{batch}/{file}`：只能由批次所属设备，在完成 accept 握手且未结束时下载。服务端再次检查源文件大小和修改时间。
 - `POST /offers/{id}/ack`：接收端校验并保存后，逐文件提交 ID 与 SHA-256。所有文件确认才完成批次。
 - `POST /offers/{id}/cancel`、`POST /transfers/{id}/cancel`：取消本设备的传输；批次中已保存的完整文件保留。
 
@@ -35,6 +35,8 @@ Mac 为唯一网络监听端，提供 TLS 1.2+ HTTPS。手机主动连接。Bonj
 `~/Library/Application Support/MiDrop` 权限 0700；私钥、凭据、状态和 `control.sock` 权限 0600。
 
 Unix Socket 接受一行 JSON，支持 snapshot、approve、queue、revoke、cancel。状态快照不包含 ticket、原始令牌或可直接授权的秘密。
+
+Mac 共享扩展运行于独立沙盒，只接收宿主提供的本地文件 URL，通过 Launch Services 交给主 App。扩展不读取凭据或连接控制 Socket；主 App 将文件暂存在待发送列表，用户选择手机并点击发送后才调用原有 `queue` 操作。主 App 声明接收 `public.data` 文档以允许沙盒扩展交接，`LSHandlerRank=None` 不参与默认打开方式的选择。
 
 Mac 临时文件完整接收和校验后，使用不可覆盖的原子硬链接提交到下载目录。Android 10+ 先写入 `IS_PENDING=1` 的 MediaStore 条目，长度与 SHA-256 符合后才发布；取消或失败则删除条目，进程异常退出后下次启动清理记录的未完成条目。
 

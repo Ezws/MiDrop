@@ -28,12 +28,11 @@ public class MainActivity extends Activity {
     private Button cancel;
     private List<Discovery.Device> nearby=new ArrayList<>();
     private Discovery.Listener discovery;
-    private String deviceStamp="",lastState="",shownOffer="";
-    private Dialog offerDialog;
+    private String deviceStamp="",lastState="";
     private boolean connecting;
     private final Runnable poll=new Runnable() { public void run() {
         if (!visible) return;
-        refreshDevices(false); refreshProgress(); showOffer(); main.postDelayed(this,500);
+        refreshDevices(false); refreshProgress(); main.postDelayed(this,500);
     }};
 
     @Override public void onCreate(Bundle state) {
@@ -93,7 +92,7 @@ public class MainActivity extends Activity {
         if (!Protocol.prefs(this).getBoolean("background_receive",true) && !SessionService.RECEIVING.get()) stopService(new Intent(this,SessionService.class));
         super.onStop();
     }
-    @Override protected void onDestroy() { worker.shutdownNow(); if (offerDialog!=null) offerDialog.dismiss(); super.onDestroy(); }
+    @Override protected void onDestroy() { worker.shutdownNow(); super.onDestroy(); }
     @Override protected void onNewIntent(Intent intent) { super.onNewIntent(intent); setIntent(intent); renderFiles(); }
     private boolean hasFiles() { return !TransferService.uris(getIntent()).isEmpty() || getIntent().getCharSequenceExtra(Intent.EXTRA_TEXT)!=null; }
     private void renderFiles() {
@@ -183,20 +182,6 @@ public class MainActivity extends Activity {
         if (size>0) progress.setProgress((int)Math.min(100,bytes*100/size));
         cancel.setVisibility(active?View.VISIBLE:View.GONE);
     }
-    private void showOffer() {
-        if (offerDialog!=null && offerDialog.isShowing()) {
-            if (!SessionService.PENDING.containsKey(shownOffer)) offerDialog.dismiss(); else return;
-        }
-        if (SessionService.RECEIVING.get()) return;
-        for (Map.Entry<String,JSONObject> item:SessionService.PENDING.entrySet()) {
-            JSONObject offer=item.getValue(); if (SessionService.DECIDING.contains(item.getKey())) continue; if (offer.optDouble("expires")*1000<System.currentTimeMillis()) continue;
-            shownOffer=item.getKey();
-            offerDialog=cardDialog(Protocol.prefs(this).getString("name","Mac")+" 想发送文件",
-                offer.optString("name")+"\n"+Protocol.size(offer.optLong("size"))+" · 保存到 Download/MiDrop",null,
-                "接收",() -> SessionService.decide(this,item.getKey(),true),"拒绝",() -> SessionService.decide(this,item.getKey(),false));
-            offerDialog.setCancelable(false); return;
-        }
-    }
     private void connect(Discovery.Device device) {
         connecting=true; refreshDevices(true); stopService(new Intent(this,SessionService.class));
         AtomicBoolean cancelled=new AtomicBoolean(false);
@@ -266,7 +251,7 @@ public class MainActivity extends Activity {
         Switch background=new Switch(this); background.setText("后台接收"); background.setTextColor(skin.text); background.setChecked(Protocol.prefs(this).getBoolean("background_receive",true));
         background.setOnCheckedChangeListener((b,checked) -> { Protocol.prefs(this).edit().putBoolean("background_receive",checked).apply(); if (checked) permissions(); SessionService.start(this); SessionService.visibilityChanged(); });
         content.addView(background); skin.gap(content,16);
-        content.addView(skin.text("后台请求会通过通知询问，不会自动接收。",13,skin.muted));
+        content.addView(skin.text("已配对且连接时自动接收文件，无需逐次确认。关闭后台接收后，仅在打开 MiDrop 时接收。",13,skin.muted));
         Button notification=skin.button("通知与后台运行权限",false); notification.setOnClickListener(v -> startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,Uri.parse("package:"+getPackageName())))); content.addView(notification);
         Button folder=skin.button("打开最近收到的文件",false); folder.setOnClickListener(v -> openLast()); content.addView(folder);
         Button manual=skin.button("手动连接",false); manual.setOnClickListener(v -> {
@@ -288,7 +273,7 @@ public class MainActivity extends Activity {
                 .setNegativeButton("取消",null).setPositiveButton("重新连接",(d,w) -> {
                     stopService(new Intent(this,SessionService.class)); Protocol.prefs(this).edit().remove("token").remove("pin").remove("server_id").putBoolean("connected",false).apply(); refreshDevices(true);
                 }).show();
-        }); content.addView(forget); skin.gap(content,16); content.addView(skin.text("MiDrop 0.2.1 · 局域网加密传输",12,skin.muted));
+        }); content.addView(forget); skin.gap(content,16); content.addView(skin.text("MiDrop 0.2.2 · 局域网加密传输",12,skin.muted));
         ScrollView scroll=new ScrollView(this); scroll.addView(content);
         new AlertDialog.Builder(this).setTitle("设置").setView(scroll).setPositiveButton("完成",null).show();
     }

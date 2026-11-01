@@ -2,6 +2,11 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import Darwin
+import OSLog
+
+// Keep using the property wrapper with CLT SDKs that expose a newer State
+// macro without shipping its SwiftUIMacros compiler plugin.
+typealias ViewState<Value> = SwiftUI.State<Value>
 
 let mint = Color(red: 0.50, green: 0.80, blue: 0.66)
 
@@ -31,7 +36,7 @@ struct Transfer: Identifiable, Equatable {
     let bytes, size: Int64
     init(_ d: [String: Any]) { id=d["id"] as? String ?? ""; name=d["name"] as? String ?? "文件"; state=d["state"] as? String ?? ""; direction=d["direction"] as? String ?? ""; bytes=(d["bytes"] as? NSNumber)?.int64Value ?? 0; size=(d["size"] as? NSNumber)?.int64Value ?? 0 }
     var active: Bool { ["preparing","waiting","accepted","transferring"].contains(state) }
-    var label: String { ["preparing":"正在准备","waiting":"等待手机确认","accepted":"手机已同意","transferring":direction == "incoming" ? "正在接收" : "正在发送","completed":"已完成","cancelled":"已取消","expired":"请求已过期","rejected":"手机已拒绝","failed":"传输未完成"][state] ?? state }
+    var label: String { ["preparing":"正在准备","waiting":"等待手机接收","accepted":"手机已就绪","transferring":direction == "incoming" ? "正在接收" : "正在发送","completed":"已完成","cancelled":"已取消","expired":"请求已过期","rejected":"手机已拒绝","failed":"传输未完成"][state] ?? state }
 }
 struct TrustRequest: Identifiable, Equatable {
     let id, name: String
@@ -49,6 +54,8 @@ final class ReceiverModel: ObservableObject {
     @Published var error = ""
     @Published var addresses = ""
     @Published var fingerprint = ""
+    @Published var sharedFiles: [URL] = []
+    @Published var submittingSharedFiles = false
     var trustArrived: (() -> Void)?
     let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MiDrop")
     let destination = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0].appendingPathComponent("MiDrop")
@@ -123,7 +130,7 @@ final class ReceiverModel: ObservableObject {
         let next=Self.localAddresses().map { "\($0):\(serverPort)" }.joined(separator:"\n")
         if addresses != next { addresses=next }
     }
-    func command(_ payload: [String:Any]) {
+    func command(_ payload: [String:Any], completion: ((Bool) -> Void)? = nil) {
         work.async { [weak self] in
             guard let self=self else { return }
             do {
@@ -133,14 +140,38 @@ final class ReceiverModel: ObservableObject {
                 try input.fileHandleForWriting.write(contentsOf:JSONSerialization.data(withJSONObject:payload)); try input.fileHandleForWriting.close()
                 let response=output.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
                 let result=(try? JSONSerialization.jsonObject(with:response)) as? [String:Any]
-                DispatchQueue.main.async { self.error=result?["error"] as? String ?? (p.terminationStatus==0 ? "" : "接收服务暂时不可用"); self.refresh() }
-            } catch { DispatchQueue.main.async { self.error=error.localizedDescription } }
+                DispatchQueue.main.async {
+                    self.error=result?["error"] as? String ?? (p.terminationStatus==0 ? "" : "接收服务暂时不可用")
+                    self.refresh(); completion?(self.error.isEmpty)
+                }
+            } catch { DispatchQueue.main.async { self.error=error.localizedDescription; completion?(false) } }
         }
     }
     func send(_ urls:[URL]) {
         guard !urls.isEmpty else { return }
         guard devices.contains(where:{$0.id==selected && $0.receiving}) else { error="请在手机打开 MiDrop，或开启后台接收。"; return }
         command(["action":"queue","device_id":selected,"paths":urls.map(\.path)])
+    }
+    func receiveSharedFiles(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        guard urls.allSatisfy(\.isFileURL), sharedFiles.count + urls.count <= 1000 else {
+            error="每次最多共享 1000 个本地文件。"; return
+        }
+        sharedFiles.append(contentsOf: urls)
+        error=""
+    }
+    func sendSharedFiles() {
+        guard !sharedFiles.isEmpty, !submittingSharedFiles, ready else { return }
+        guard devices.contains(where:{$0.id==selected && $0.receiving}) else {
+            error="请在手机打开 MiDrop，或开启后台接收。"; return
+        }
+        let batch=sharedFiles
+        submittingSharedFiles=true
+        command(["action":"queue","device_id":selected,"paths":batch.map(\.path)]) { [weak self] success in
+            guard let self else { return }
+            self.submittingSharedFiles=false
+            if success { self.sharedFiles.removeFirst(batch.count) }
+        }
     }
     func chooseFiles() {
         let panel=NSOpenPanel(); panel.canChooseFiles=true; panel.canChooseDirectories=false; panel.allowsMultipleSelection=true; panel.prompt="发送到手机"
@@ -173,10 +204,29 @@ final class ReceiverModel: ObservableObject {
     }
 }
 
+struct SharedFilesView: View {
+    @ObservedObject var model: ReceiverModel
+    var body: some View {
+        VStack(alignment:.leading,spacing:10) {
+            Text("待发送 · \(model.sharedFiles.count) 个文件").font(.system(size:13,weight:.medium))
+            Text(model.sharedFiles.prefix(3).map(\.lastPathComponent).joined(separator:"\n"))
+                .font(.system(size:11)).foregroundStyle(.secondary).lineLimit(3)
+            Text("选择上方手机后发送").font(.system(size:11)).foregroundStyle(.secondary)
+            HStack {
+                Button("取消") { model.sharedFiles=[] }.disabled(model.submittingSharedFiles)
+                Spacer()
+                Button(model.submittingSharedFiles ? "正在提交…" : "发送到手机") { model.sendSharedFiles() }
+                    .buttonStyle(.borderedProminent).tint(mint).foregroundStyle(Color.black.opacity(0.8))
+                    .disabled(!model.ready || model.submittingSharedFiles || !model.devices.contains(where:{$0.id==model.selected && $0.receiving}))
+            }
+        }.padding(14).background(mint.opacity(0.12),in:RoundedRectangle(cornerRadius:15))
+    }
+}
+
 struct PanelView: View {
     @ObservedObject var model:ReceiverModel
     var settings:()->Void = {}
-    @State private var dropTarget=false
+    @ViewState private var dropTarget=false
     var body: some View {
         VStack(spacing:0) {
             HStack(spacing:9) {
@@ -214,6 +264,9 @@ struct PanelView: View {
                                     .overlay(RoundedRectangle(cornerRadius:15).strokeBorder(model.selected==device.id ? mint.opacity(0.6) : .clear,lineWidth:1))
                             }.buttonStyle(.plain).contextMenu { Button("取消信任") { model.revoke(device) } }
                         }
+                    }
+                    if !model.sharedFiles.isEmpty {
+                        SharedFilesView(model:model)
                     }
                     Button { model.chooseFiles() } label: {
                         VStack(spacing:9) {
@@ -310,6 +363,8 @@ final class AppDelegate:NSObject,NSApplicationDelegate {
     var item:NSStatusItem!
     let popover=NSPopover()
     var settingsWindow:NSWindow?
+    var shareWindow:NSWindow?
+    private var openedFiles: [URL] = []
     func applicationDidFinishLaunching(_ notification:Notification) {
         let args=CommandLine.arguments
         if let index=args.firstIndex(of:"--preview"),index+1<args.count {
@@ -321,7 +376,11 @@ final class AppDelegate:NSObject,NSApplicationDelegate {
         popover.behavior = .transient; popover.contentSize=NSSize(width:360,height:480)
         popover.contentViewController=NSHostingController(rootView:PanelView(model:model,settings:{ [weak self] in self?.showSettings() }))
         model.trustArrived={ [weak self] in self?.show() }
-        DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { [weak self] in self?.show() }
+        if !openedFiles.isEmpty { model.receiveSharedFiles(openedFiles); openedFiles=[] }
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { [weak self] in
+            guard let self else { return }
+            if self.model.sharedFiles.isEmpty { self.show() } else { self.showSharedFiles() }
+        }
     }
     @objc func toggle() { if popover.isShown { popover.performClose(nil) } else { show() } }
     func show() { guard let button=item?.button else { return }; NSApp.activate(ignoringOtherApps:true); popover.show(relativeTo:button.bounds,of:button,preferredEdge:.minY) }
@@ -335,6 +394,24 @@ final class AppDelegate:NSObject,NSApplicationDelegate {
         settingsWindow?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps:true)
     }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool)->Bool { show(); return true }
+    func application(_ application:NSApplication,open urls:[URL]) {
+        Logger(subsystem:"dev.midrop.mac",category:"share").notice("Received \(urls.count) shared file URLs")
+        guard let model else { openedFiles.append(contentsOf:urls); return }
+        model.receiveSharedFiles(urls)
+        // A regular window stays visible when Finder finishes closing its
+        // share sheet, and gives offline devices time to reconnect.
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { [weak self] in self?.showSharedFiles() }
+    }
+    func showSharedFiles() {
+        popover.performClose(nil)
+        if shareWindow==nil {
+            let window=NSWindow(contentRect:NSRect(x:0,y:0,width:360,height:480),styleMask:[.titled,.closable,.miniaturizable],backing:.buffered,defer:false)
+            window.title="MiDrop · 发送文件"
+            window.contentView=NSHostingView(rootView:PanelView(model:model,settings:{ [weak self] in self?.showSettings() }))
+            window.isReleasedWhenClosed=false; window.center(); shareWindow=window
+        }
+        shareWindow?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps:true)
+    }
     func applicationWillTerminate(_ notification:Notification) { model?.stop() }
     func renderPreview(to path:String,dark:Bool) {
         model=ReceiverModel(preview:true)

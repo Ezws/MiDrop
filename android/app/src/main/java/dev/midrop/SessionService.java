@@ -18,13 +18,10 @@ import org.json.*;
 
 /** Phone-initiated, pinned connection: no inbound listening port on Android. */
 public class SessionService extends Service {
-    static final Set<String> DECIDING=ConcurrentHashMap.newKeySet();
-    static final Map<String,JSONObject> PENDING=new ConcurrentHashMap<>();
     private final Set<String> handled=ConcurrentHashMap.newKeySet();
     static final AtomicBoolean RECEIVING=new AtomicBoolean(false);
     static volatile SessionService instance;
     private static final int CONNECTION=81, PROGRESS=82;
-    private final ExecutorService decisions=Executors.newSingleThreadExecutor();
     private final ExecutorService downloads=Executors.newSingleThreadExecutor();
     private volatile boolean running,cancelReceive,refreshRequested;
     private volatile HttpsURLConnection pollConnection,downloadConnection;
@@ -34,11 +31,9 @@ public class SessionService extends Service {
     private final Handler main=new Handler(Looper.getMainLooper());
     private NotificationManager manager;
 
-    static boolean notifications(Context c) {
-        NotificationManager nm=(NotificationManager)c.getSystemService(NOTIFICATION_SERVICE);
-        NotificationChannel channel=nm.getNotificationChannel("incoming");
-        return nm.areNotificationsEnabled() && (Build.VERSION.SDK_INT<33 || c.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)==PackageManager.PERMISSION_GRANTED)
-            && (channel==null || channel.getImportance()!=NotificationManager.IMPORTANCE_NONE);
+    private boolean canReceive() {
+        return (MainActivity.visible || Protocol.prefs(this).getBoolean("background_receive",true))
+            && (Build.VERSION.SDK_INT>=29 || checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)==PackageManager.PERMISSION_GRANTED);
     }
     static void start(Context c) {
         if (!Protocol.prefs(c).getString("token","").isEmpty() && (MainActivity.visible || Protocol.prefs(c).getBoolean("background_receive",true)))
@@ -48,26 +43,22 @@ public class SessionService extends Service {
         SessionService s=instance;
         if (s!=null && s.pollConnection!=null) { s.refreshRequested=true; s.pollConnection.disconnect(); }
     }
-    static void decide(Context c,String id,boolean accept) {
-        DECIDING.add(id);
-        c.startForegroundService(new Intent(c,SessionService.class).setAction("DECIDE").putExtra("id",id).putExtra("accept",accept));
-    }
     private PendingIntent open() { return PendingIntent.getActivity(this,0,new Intent(this,MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE); }
-    private PendingIntent action(String action,String id,boolean accept) {
-        Intent i=new Intent(this,SessionService.class).setAction(action).putExtra("id",id).putExtra("accept",accept).setData(Uri.parse("midrop://action/"+action+"/"+id+"/"+accept));
+    private PendingIntent action(String action,String id) {
+        Intent i=new Intent(this,SessionService.class).setAction(action).putExtra("id",id).setData(Uri.parse("midrop://action/"+action+"/"+id));
         return PendingIntent.getService(this,0,i,PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
     }
     private Notification connectionNotice(String text) {
         return new Notification.Builder(this,"connection").setSmallIcon(R.drawable.ic_status).setContentTitle("MiDrop")
             .setContentText(text).setContentIntent(open()).setOngoing(true).setOnlyAlertOnce(true)
-            .addAction(new Notification.Action.Builder(null,"暂停接收",action("STOP","",false)).build()).build();
+            .addAction(new Notification.Action.Builder(null,"暂停接收",action("STOP","")).build()).build();
     }
     @Override public void onCreate() {
         super.onCreate(); instance=this;
         manager=(NotificationManager)getSystemService(NOTIFICATION_SERVICE);
         manager.createNotificationChannel(new NotificationChannel("connection","后台连接",NotificationManager.IMPORTANCE_LOW));
-        NotificationChannel incoming=new NotificationChannel("incoming","接收文件请求",NotificationManager.IMPORTANCE_HIGH);
-        incoming.setDescription("收到文件时确认接收或拒绝"); manager.createNotificationChannel(incoming);
+        // Remove obsolete per-batch confirmation notifications on upgrade.
+        manager.deleteNotificationChannel("incoming");
         manager.createNotificationChannel(new NotificationChannel("receive","接收进度",NotificationManager.IMPORTANCE_LOW));
         for (String uri:new HashSet<>(Protocol.prefs(this).getStringSet("partial_uris",Collections.emptySet()))) {
             try { getContentResolver().delete(Uri.parse(uri),null,null); } catch (Exception ignored) {}
@@ -99,10 +90,7 @@ public class SessionService extends Service {
         if (!running) {
             running=true; poller=new Thread(this::poll,"MiDrop-session"); poller.start();
         }
-        if (intent!=null && "DECIDE".equals(intent.getAction())) {
-            final String id=intent.getStringExtra("id"); DECIDING.add(id); final boolean accept=intent.getBooleanExtra("accept",false);
-            decisions.execute(() -> respond(id,accept));
-        } else if (intent!=null && "CANCEL".equals(intent.getAction())) {
+        if (intent!=null && "CANCEL".equals(intent.getAction())) {
             cancelReceive=true;
             if (downloadConnection!=null) downloadConnection.disconnect();
         }
@@ -113,25 +101,30 @@ public class SessionService extends Service {
         while (running) {
             HttpsURLConnection c=null;
             try {
-                boolean ready=(MainActivity.visible || Protocol.prefs(this).getBoolean("background_receive",true))
-                    && (MainActivity.visible || notifications(this))
-                    && (Build.VERSION.SDK_INT>=29 || checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)==PackageManager.PERMISSION_GRANTED);
+                boolean ready=canReceive();
                 JSONObject body=new JSONObject().put("receiving",ready).put("name",Protocol.deviceName(this));
                 c=Protocol.authenticated(this,"/events"); pollConnection=c;
                 JSONObject result=Protocol.post(c,body);
                 if (!running) break;
                 Protocol.prefs(this).edit().putString("device_id",result.getString("device_id")).putString("server_id",result.getString("server_id"))
                     .putBoolean("connected",true).putString("connection_error","").apply();
-                JSONArray offers=result.getJSONArray("offers"); Set<String> live=new HashSet<>();
+                JSONArray offers=result.getJSONArray("offers");
                 for (int i=0;i<offers.length();i++) {
-                    JSONObject offer=offers.getJSONObject(i); String id=offer.getString("id"); live.add(id);
-                    if (!handled.contains(id) && !DECIDING.contains(id) && PENDING.putIfAbsent(id,offer)==null) offerNotice(offer);
+                    JSONObject offer=offers.getJSONObject(i); String id=offer.getString("id");
+                    // Accept one batch at a time. Other offers remain on the Mac
+                    // and are picked up automatically after this receive ends.
+                    if (canReceive() && !handled.contains(id) && RECEIVING.compareAndSet(false,true)) {
+                        downloads.execute(() -> receiveAutomatically(offer));
+                        break;
+                    }
                 }
-                for (String id:new ArrayList<>(PENDING.keySet())) if (!live.contains(id)) { PENDING.remove(id); manager.cancel(noticeId(id)); }
                 if (SystemClock.elapsedRealtime()-lastNotice>15000) {
-                    manager.notify(CONNECTION,connectionNotice(ready?"已连接 · 等待接收请求":"已连接 · 请开启通知或打开 MiDrop 接收"));
+                    manager.notify(CONNECTION,connectionNotice(ready?"已连接 · 自动接收文件":"已连接 · 接收已暂停，请打开 MiDrop 检查设置和保存权限"));
                     lastNotice=SystemClock.elapsedRealtime();
                 }
+                // Waiting offers make /events return immediately. Avoid a hot
+                // polling loop while another batch is already downloading.
+                if (offers.length()>0 && RECEIVING.get()) Thread.sleep(500);
             } catch (Exception error) {
                 if (!running) break;
                 if (refreshRequested) { refreshRequested=false; continue; }
@@ -140,38 +133,27 @@ public class SessionService extends Service {
             } finally { if (c!=null) c.disconnect(); pollConnection=null; }
         }
     }
-    private int noticeId(String id) { return 1000+(id.hashCode() & 0x3fffffff); }
-    private void offerNotice(JSONObject offer) {
+    private void receiveAutomatically(JSONObject offer) {
         String id=offer.optString("id");
-        Notification notice=new Notification.Builder(this,"incoming").setSmallIcon(R.drawable.ic_status)
-            .setContentTitle(Protocol.prefs(this).getString("name","Mac")+" 想发送文件")
-            .setContentText(offer.optString("name")+" · "+Protocol.size(offer.optLong("size")))
-            .setContentIntent(open()).setAutoCancel(false).setOnlyAlertOnce(true).setVisibility(Notification.VISIBILITY_PRIVATE)
-            .setTimeoutAfter(Math.max(1000,(long)(offer.optDouble("expires")*1000-System.currentTimeMillis())))
-            .addAction(new Notification.Action.Builder(null,"接收",action("DECIDE",id,true)).build())
-            .addAction(new Notification.Action.Builder(null,"拒绝",action("DECIDE",id,false)).build()).build();
-        manager.notify(noticeId(id),notice);
-    }
-    private void respond(String id,boolean accept) {
-        JSONObject offer=PENDING.get(id);
-        if (offer==null) { DECIDING.remove(id); return; }
-        if (accept && !RECEIVING.compareAndSet(false,true)) { DECIDING.remove(id); return; }
         try {
-            Protocol.post(this,"/offers/"+id+"/decision",new JSONObject().put("decision",accept?"accept":"reject"));
-            handled.add(id); PENDING.remove(id); manager.cancel(noticeId(id));
-            if (accept) downloads.execute(() -> receive(offer));
+            // Recheck after scheduling in case the user paused or disconnected.
+            if (!running || !canReceive()) return;
+            Protocol.post(this,"/offers/"+id+"/decision",new JSONObject().put("decision","accept"));
+            handled.add(id);
+            receive(offer);
         } catch (Exception error) {
-            if (accept) RECEIVING.set(false);
-            PENDING.remove(id); manager.cancel(noticeId(id));
-            Protocol.progress(this,"incoming","failed",offer.optString("name"),0,offer.optLong("size"),"接收请求已失效，请在 Mac 重新发送");
-        } finally { DECIDING.remove(id); }
+            Protocol.progress(this,"incoming","failed",offer.optString("name"),0,offer.optLong("size"),"无法开始接收，请在 Mac 重新发送");
+        } finally {
+            RECEIVING.set(false);
+            visibilityChanged();
+        }
     }
     private void progress(JSONObject offer,long done,long size,String state,String message) {
         Protocol.progress(this,"incoming",state,offer.optString("name"),done,size,message);
         Notification.Builder b=new Notification.Builder(this,"receive").setSmallIcon(R.drawable.ic_status).setContentTitle("MiDrop · "+message)
             .setContentText(offer.optString("name")).setContentIntent(open()).setOnlyAlertOnce(true).setOngoing(state.equals("transferring"));
         if (state.equals("transferring")) b.setProgress(100,size==0?0:(int)(done*100/size),false)
-            .addAction(new Notification.Action.Builder(null,"取消",action("CANCEL",offer.optString("id"),false)).build());
+            .addAction(new Notification.Action.Builder(null,"取消",action("CANCEL",offer.optString("id"))).build());
         manager.notify(PROGRESS,b.build());
     }
     private void receive(JSONObject offer) {
@@ -260,7 +242,7 @@ public class SessionService extends Service {
             progress(offer,done,total,cancelReceive?"cancelled":"failed",(cancelReceive?"已取消": "接收未完成："+error.getMessage())+" · 已保存 "+count+" 个文件");
         } finally {
             if (wake.isHeld()) wake.release();
-            currentOffer=""; RECEIVING.set(false);
+            currentOffer="";
             main.post(() -> { if (!MainActivity.visible && !Protocol.prefs(this).getBoolean("background_receive",true)) shutdown(); });
         }
     }
@@ -282,9 +264,9 @@ public class SessionService extends Service {
         running=false; cancelReceive=true;
         if (pollConnection!=null) pollConnection.disconnect(); if (downloadConnection!=null) downloadConnection.disconnect();
         if (poller!=null) poller.interrupt();
-        Discovery.get(this).remove(discovery); for (String id:PENDING.keySet()) manager.cancel(noticeId(id)); PENDING.clear(); DECIDING.clear();
+        Discovery.get(this).remove(discovery);
         Protocol.prefs(this).edit().putBoolean("connected",false).apply();
-        instance=null; decisions.shutdownNow(); downloads.shutdownNow(); super.onDestroy();
+        instance=null; downloads.shutdownNow(); super.onDestroy();
     }
     @Override public IBinder onBind(Intent i) { return null; }
 }
